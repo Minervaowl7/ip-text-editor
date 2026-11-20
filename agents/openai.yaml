@@ -1,0 +1,4 @@
+interface:
+  display_name: "知识产权文字编辑"
+  short_description: "审改知识产权主题成稿中的怪话、套话与工作痕迹，保留原意和专业语体"
+  default_prompt: "使用 $ip-text-editor 审改这份知识产权主题文稿，处理生硬表达和工作痕迹，保留原意与适用文体。"
