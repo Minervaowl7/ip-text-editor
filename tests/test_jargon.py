@@ -480,6 +480,53 @@ class JargonScannerTests(unittest.TestCase):
         self.assertNotIn("权利底座", "\n".join(findings(result.stdout)))
         self.assertIn("L2: 权利底座", "\n".join(protected(result.stdout)))
 
+    def test_soft_wrapped_inline_code_span_stays_protected(self):
+        tick = "`"
+        content = (
+            f"字段示例：{tick}前缀\n"
+            "权利底座\n"
+            f"后缀{tick}。\n\n"
+            f"统计口径按{tick}基于\n基于基于基于基于基于{tick}记录。\n\n"
+            "报告初稿提到质量体检。\n"
+        )
+        result = self.scan_text(content, name="wrapped_code.md")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        output = "\n".join(findings(result.stdout))
+        self.assertIn("L8: 质量体检", output)
+        self.assertNotIn("权利底座", output)
+        self.assertIn("L1: 权利底座", "\n".join(protected(result.stdout)))
+        self.assertNotIn("全文密度", result.stdout)
+
+    def test_fence_inside_numbered_list_is_protected(self):
+        fence = "```"
+        content = (
+            "1. 示例：\n"
+            f"    {fence}text\n"
+            "    权利底座\n"
+            f"    {fence}\n"
+            "\n"
+            "报告初稿提到质量体检。\n"
+        )
+        result = self.scan_text(content, name="list_fence.md")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        output = "\n".join(findings(result.stdout))
+        self.assertIn("L6: 质量体检", output)
+        self.assertNotIn("权利底座", output)
+
+    def test_unclosed_list_fence_ends_at_the_list_boundary(self):
+        for opener in ("1. 示例：\n    ~~~", "1) ~~~"):
+            with self.subTest(opener=opener):
+                result = self.scan_text(opener + "\n    权利底座\n\n质量体检。")
+                self.assertIn("质量体检", "\n".join(findings(result.stdout)))
+                self.assertNotIn("权利底座", "\n".join(findings(result.stdout)))
+
+    def test_thematic_break_ends_lazy_blockquote_continuation(self):
+        content = "> 对方引文。\n---\n权利底座\n"
+        result = self.scan_text(content, name="quote_break.md")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("L3: 权利底座", "\n".join(findings(result.stdout)))
+        self.assertNotIn("权利底座", "\n".join(protected(result.stdout)))
+
     def test_inline_code_in_cells_and_repeated_literals_stay_protected(self):
         tick = "`"
         result = self.scan_text(

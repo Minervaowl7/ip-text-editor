@@ -9,6 +9,8 @@ toward body word frequency, slash-column findings, or rewrite suggestions.
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
+from itertools import groupby
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -117,8 +119,11 @@ MD_FENCE_OPEN_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
 MD_FENCE_CLOSE_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})[ \t]*$")
 MD_TABLE_SEP_RE = re.compile(r"^\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?$")
 MD_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+")
-MD_LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+")
+MD_LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*+]|\d{1,9}[.)])\s+")
 MD_ITALIC_NOTE_RE = re.compile(r"^\s*\*[^*]+\*\s*$")
+MD_THEMATIC_BREAK_RE = re.compile(
+    r"^(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$"
+)
 
 LONG_SENTENCE_LIMIT = 85
 REPEAT_CJK_WINDOW = 28
@@ -229,7 +234,8 @@ def parse_markdown_or_text(path: Path) -> list[Segment]:
     in_blockquote = False
     markdown = path.suffix.lower() != ".txt"
     paragraph_open = False
-    list_indent = 0
+    list_indents: list[int] = []
+    fence_indent = 0
     idx = 0
 
     while idx < len(raw_lines):
@@ -237,26 +243,32 @@ def parse_markdown_or_text(path: Path) -> list[Segment]:
         line_no = idx + 1
         stripped = raw.strip()
 
-        if fence is not None:
-            if _closes_fence(raw, fence):
-                fence = None
-            in_table = False
-            idx += 1
-            continue
-
         expanded = raw.expandtabs(4)
         indent = len(expanded) - len(expanded.lstrip(" "))
-        if stripped and indent < list_indent:
-            list_indent = 0
+        if fence is not None:
+            if stripped and indent < fence_indent:
+                fence = None  # An unindented block ends the list containing the fence.
+            else:
+                if _closes_fence(expanded[fence_indent:], fence):
+                    fence = None
+                idx += 1
+                continue
+        while stripped and list_indents and indent < list_indents[-1]:
+            list_indents.pop()
+        list_indent = list_indents[-1] if list_indents else 0
         if markdown and not paragraph_open and stripped and indent >= list_indent + 4:
             in_table = False
             idx += 1
             continue
         paragraph_open = False
 
-        opener = _fence_opener(raw)
+        marker = MD_LIST_PREFIX_RE.match(expanded)
+        fence_indent = marker.end() if markdown and marker else list_indent
+        opener = _fence_opener(expanded[fence_indent:])
         if opener is not None:
             fence = opener
+            if marker and markdown:
+                list_indents.append(fence_indent)
             in_table = False
             in_blockquote = False
             idx += 1
@@ -305,6 +317,11 @@ def parse_markdown_or_text(path: Path) -> list[Segment]:
         elif MD_ITALIC_NOTE_RE.match(stripped):
             in_blockquote = False
             segments.append(Segment(f"L{line_no}", "note", stripped.strip("* ").strip(), role="注释"))
+        elif markdown and indent <= list_indent + 3 and MD_THEMATIC_BREAK_RE.fullmatch(stripped):
+            # A thematic break closes the quotation; the text after it is prose again.
+            in_blockquote = False
+            idx += 1
+            continue
         elif in_blockquote and not MD_LIST_PREFIX_RE.match(stripped):
             # Markdown lazy continuation: the line still belongs to the open quotation.
             segments.append(
@@ -312,9 +329,8 @@ def parse_markdown_or_text(path: Path) -> list[Segment]:
             )
         else:
             in_blockquote = False
-            marker = MD_LIST_PREFIX_RE.match(expanded)
             if marker:
-                list_indent = marker.end()
+                list_indents.append(marker.end())
             cleaned = MD_LIST_PREFIX_RE.sub("", stripped)
             start = line_no if markdown else 0
             if markdown and not marker and segments and idx and segments[-1].paragraph_start:
@@ -707,16 +723,65 @@ def _category_hits(
     return hits
 
 
-def _split_inline_code(text: str) -> tuple[str, list[str]]:
-    literals: list[str] = []
+def _split_inline_code_spans(text: str) -> tuple[str, list[tuple[int, str]]]:
+    """Mask inline code spans, keeping each literal's offset in the masked text."""
+
+    literals: list[tuple[int, str]] = []
 
     def replace(match: re.Match[str]) -> str:
         value = match.group(2).strip()
         if value:
-            literals.append(value)
+            literals.append((match.start(2), value))
         return " " * len(match.group(0))
 
     return INLINE_CODE_RE.sub(replace, text), literals
+
+
+def _split_inline_code(text: str) -> tuple[str, list[str]]:
+    masked, literals = _split_inline_code_spans(text)
+    return masked, [value for _, value in literals]
+
+
+def _soft_join(parts: list[str]) -> tuple[str, list[int]]:
+    """Join soft-wrapped lines the way ``_paragraph_units`` does, reporting offsets."""
+
+    chunks: list[str] = []
+    offsets: list[int] = []
+    position = 0
+    for index, text in enumerate(parts):
+        if index and parts[index - 1][-1:].isascii() and text[:1].isascii():
+            chunks.append(" ")
+            position += 1
+        offsets.append(position)
+        chunks.append(text)
+        position += len(text)
+    return "".join(chunks), offsets
+
+
+def _paragraph_inline_code(parts: list[Segment]) -> list[tuple[str, list[str]]]:
+    """Mask inline code over a whole paragraph so a wrapped span stays one span."""
+
+    texts = [part.text for part in parts]
+    joined, offsets = _soft_join(texts)
+    masked, literals = _split_inline_code_spans(joined)
+    result: list[tuple[str, list[str]]] = [
+        (masked[offset : offset + len(text)], []) for offset, text in zip(offsets, texts)
+    ]
+    for position, value in literals:
+        # A wrapped literal belongs to the line where the span opens.
+        owner = bisect_right(offsets, position) - 1
+        result[owner][1].append(value)
+    return result
+
+
+def _paragraph_masks(segments: list[Segment]) -> list[tuple[str, list[str]]]:
+    masks = []
+    for start, group in groupby(segments, key=lambda seg: seg.paragraph_start):
+        if start:
+            masks.extend(_paragraph_inline_code(list(group)))
+        else:
+            masks.extend(_split_inline_code(seg.text) for seg in group)
+    return masks
 
 
 def _protection_reason(seg: Segment) -> str:
@@ -793,9 +858,10 @@ def _scan_segment(
     column: int = 0,
     findings: list[Finding],
     disclose,
+    inline: tuple[str, list[str]] | None = None,
 ) -> None:
     suffix = f"（第{column}列）" if column else ""
-    masked, literals = _split_inline_code(seg.text)
+    masked, literals = inline if inline is not None else _split_inline_code(seg.text)
     for category, snippet in _category_hits(masked, entries):
         if editable:
             findings.append(
@@ -815,15 +881,17 @@ def _location_key(location: str):
 
 
 def _paragraph_units(segments: list[Segment]) -> list[Segment]:
-    units: list[Segment] = []
-    for seg in segments:
-        if seg.paragraph_start and units and seg.paragraph_start == units[-1].paragraph_start:
-            prior = units[-1]
-            space = " " if prior.text[-1:].isascii() and seg.text[:1].isascii() else ""
-            units[-1] = replace(prior, text=prior.text + space + seg.text,
-                                location=f"L{seg.paragraph_start}-{seg.location}")
-        else:
-            units.append(seg)
+    units = []
+    for start, lines in groupby(segments, key=lambda seg: seg.paragraph_start):
+        if not start:
+            units.extend(lines)
+            continue
+        parts = list(lines)
+        if len(parts) == 1:
+            units.extend(parts)
+            continue
+        text, _ = _soft_join([part.text for part in parts])
+        units.append(replace(parts[0], text=text, location=f"L{start}-{parts[-1].location}"))
     return units
 
 
@@ -912,6 +980,7 @@ def analyze_file(path: Path) -> FileReport:
 
     protected = _protected_columns(segments)
     table_legends = _table_legends(segments)
+    masks = _paragraph_masks(segments)
     prose_entries: list[LegendEntry] = []
     previous_table = ""
     table_headers: dict[str, dict[int, str]] = defaultdict(dict)
@@ -923,7 +992,7 @@ def analyze_file(path: Path) -> FileReport:
                 prior = table_headers[seg.table].get(index, "")
                 table_headers[seg.table][index] = f"{prior} {cell.strip()}".strip()
 
-    for seg in segments:
+    for seg_index, seg in enumerate(segments):
         if seg.kind in {"table_header", "table_row"}:
             blocked = protected.get(seg.table, set())
             if previous_table and previous_table != seg.table:
@@ -1019,7 +1088,7 @@ def analyze_file(path: Path) -> FileReport:
         if seg.kind == "heading" or re.match(r"^表(?:[A-Z0-9一二三四五六七八九十]+)(?:[ \u3000]|$)", seg.text):
             prose_entries = []
         if seg.editable:
-            clean, _ = _split_inline_code(seg.text)
+            clean = masks[seg_index][0]
             definitions = [LegendEntry(m[1], m[2], _legend_metric(clean))
                            for m in LEGEND_INLINE_RE.finditer(clean)]
             if definitions:
@@ -1032,6 +1101,7 @@ def analyze_file(path: Path) -> FileReport:
             entries=prose_entries,
             findings=findings,
             disclose=disclose,
+            inline=masks[seg_index],
         )
 
     paragraphs = _paragraph_units(segments)
@@ -1044,10 +1114,11 @@ def analyze_file(path: Path) -> FileReport:
     _check_repetitions(paragraphs, protected, findings, disclose)
 
     total_cjk = len(CJK_RE.findall("\n".join(seg.text for seg in segments)))
-    body_segments = [
-        seg for seg in segments if seg.kind in {"prose", "heading"} and seg.editable
-    ]
-    body_text = "\n".join(_split_inline_code(seg.text)[0] for seg in body_segments)
+    body_text = "\n".join(
+        masks[index][0]
+        for index, seg in enumerate(segments)
+        if seg.kind in {"prose", "heading"} and seg.editable
+    )
     body_cjk = len(CJK_RE.findall(body_text))
 
     crutch_stats: list[tuple[str, int, float, bool]] = []
