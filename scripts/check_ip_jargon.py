@@ -21,6 +21,15 @@ CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 URL_RE = re.compile(r"https?://\S+")
 INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
 
+WORD_NAMESPACES = frozenset(
+    {
+        "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+        "http://purl.oclc.org/ooxml/wordprocessingml/main",
+    }
+)
+QUOTE_STYLES = frozenset({"Quote", "BlockText", "IntenseQuote", "QuoteChar"})
+WRAPPER_ELEMENTS = frozenset({"sdt", "sdtContent", "customXml", "smartTag", "ins", "moveTo"})
+
 CATEGORY_ORDER = (
     "伪专业隐喻",
     "英文直译腔",
@@ -76,7 +85,10 @@ SLASH_EXCLUDE_RE = re.compile(
 EVIDENCE_RATING_RE = re.compile(
     r"(?:侵权)?(?:可)?取证(?:性|难度|容易程度|易得性|难易程度)?\s*[：:]?\s*(较高|较低|中等|高|中|低)"
 )
-EVIDENCE_DIRECTION_RE = re.compile(r"难度|容易|易得|难易")
+EVIDENCE_DIRECTION_RE = re.compile(r"难度|容易程度|容易|易得")
+EVIDENCE_METRIC_RE = re.compile(r"取证|侵权")
+OTHER_METRIC_RE = re.compile(r"研发|开发|实施|运营|维护|诉讼|许可|布局|规避|检索")
+RATING_VALUE_SET = frozenset(("较高", "较低", "中等", "高", "中", "低"))
 LEGEND_INLINE_RE = re.compile(r"(高|中|低)\s*[＝=:：]\s*(较难|较易|中等|难|易)")
 LEGEND_MEANING_RE = re.compile(r"较难|较易|中等|难|易")
 LEGEND_HEADER_RE = re.compile(r"图例|评级|含义|定义|等级|打分")
@@ -100,6 +112,7 @@ CRUTCH_WORDS = (
 )
 
 MD_FENCE_OPEN_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
+MD_FENCE_CLOSE_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})[ \t]*$")
 MD_TABLE_SEP_RE = re.compile(r"^\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?$")
 MD_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+")
 MD_LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+")
@@ -131,6 +144,8 @@ class Segment:
     table: str = ""
     editable: bool = True
     role: str = "正文"
+    # Per-cell role for table rows, e.g. 引文 for a Word cell that only holds Quote paragraphs.
+    cell_roles: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -184,9 +199,14 @@ def _fence_opener(line: str) -> tuple[str, int] | None:
 
 
 def _closes_fence(line: str, fence: tuple[str, int]) -> bool:
+    """A closing fence may be indented by at most three spaces."""
+
     char, length = fence
-    stripped = line.strip()
-    return len(stripped) >= length and set(stripped) == {char}
+    match = MD_FENCE_CLOSE_RE.match(line)
+    if not match:
+        return False
+    marker = match.group("fence")
+    return marker[0] == char and len(marker) >= length
 
 
 def parse_markdown_or_text(path: Path) -> list[Segment]:
@@ -201,6 +221,7 @@ def parse_markdown_or_text(path: Path) -> list[Segment]:
     table_counter = 0
     table_id = ""
     in_table = False
+    in_blockquote = False
     idx = 0
 
     while idx < len(raw_lines):
@@ -219,11 +240,13 @@ def parse_markdown_or_text(path: Path) -> list[Segment]:
         if opener is not None:
             fence = opener
             in_table = False
+            in_blockquote = False
             idx += 1
             continue
 
         if not stripped:
             in_table = False
+            in_blockquote = False
             idx += 1
             continue
 
@@ -233,6 +256,7 @@ def parse_markdown_or_text(path: Path) -> list[Segment]:
             cells = _split_md_cells(stripped)
             segments.append(Segment(f"L{line_no}", "table_header", " | ".join(cells), cells, table_id))
             in_table = True
+            in_blockquote = False
             idx += 2
             continue
 
@@ -245,10 +269,12 @@ def parse_markdown_or_text(path: Path) -> list[Segment]:
         in_table = False
         table_id = ""
         if MD_HEADING_RE.match(stripped):
+            in_blockquote = False
             segments.append(
                 Segment(f"L{line_no}", "heading", MD_HEADING_RE.sub("", stripped), role="标题")
             )
         elif stripped.startswith(">"):
+            in_blockquote = True
             segments.append(
                 Segment(
                     f"L{line_no}",
@@ -259,8 +285,15 @@ def parse_markdown_or_text(path: Path) -> list[Segment]:
                 )
             )
         elif MD_ITALIC_NOTE_RE.match(stripped):
+            in_blockquote = False
             segments.append(Segment(f"L{line_no}", "note", stripped.strip("* ").strip(), role="注释"))
+        elif in_blockquote and not MD_LIST_PREFIX_RE.match(stripped):
+            # Markdown lazy continuation: the line still belongs to the open quotation.
+            segments.append(
+                Segment(f"L{line_no}", "blockquote", stripped, editable=False, role="引文")
+            )
         else:
+            in_blockquote = False
             cleaned = MD_LIST_PREFIX_RE.sub("", stripped)
             segments.append(Segment(f"L{line_no}", "prose", cleaned))
         idx += 1
@@ -296,12 +329,19 @@ class _DocxReader:
                 return child
         return None
 
-    def _children(self, element: ET.Element, name: str) -> list[ET.Element]:
-        return [
-            child
-            for child in element
-            if _local_name(child.tag) == name and _namespace(child.tag) == self.ns
-        ]
+    def _descend(self, container: ET.Element, names: frozenset[str] | set[str]) -> list[ET.Element]:
+        """Collect child elements by name, looking through content controls and tags."""
+
+        found: list[ET.Element] = []
+        for child in container:
+            if _namespace(child.tag) != self.ns:
+                continue
+            local = _local_name(child.tag)
+            if local in names:
+                found.append(child)
+            elif local in WRAPPER_ELEMENTS:
+                found.extend(self._descend(child, names))
+        return found
 
     def _hidden_run(self, run: ET.Element) -> bool:
         properties = self._child(run, "rPr")
@@ -353,6 +393,11 @@ class _DocxReader:
             return ""
         return style.get(self._tag("val"), "")
 
+    def _quoted_paragraph(self, paragraph: ET.Element, text: str) -> bool:
+        if self._paragraph_style(paragraph) in QUOTE_STYLES:
+            return True
+        return text.startswith(">")
+
     def add_paragraph(self, paragraph: ET.Element) -> None:
         self._paragraph_index += 1
         text = self._flatten(self._inline_text(paragraph))
@@ -363,7 +408,7 @@ class _DocxReader:
             return
         if style.startswith(("Heading", "Title", "Subtitle")):
             kind, role = "heading", "标题"
-        elif style in {"Quote", "BlockText", "IntenseQuote"} or text.startswith(">"):
+        elif self._quoted_paragraph(paragraph, text):
             kind, role = "blockquote", "引文"
         elif MD_ITALIC_NOTE_RE.match(text):
             kind, role = "note", "注释"
@@ -387,38 +432,71 @@ class _DocxReader:
             return False
         return self._child(properties, "tblHeader") is not None
 
-    def _cell_text(self, container: ET.Element) -> str:
+    def _grid_offset(self, row: ET.Element, name: str) -> int:
+        """Number of leading or trailing grid columns this row skips."""
+
+        properties = self._child(row, "trPr")
+        if properties is None:
+            return 0
+        node = self._child(properties, name)
+        if node is None:
+            return 0
+        try:
+            return max(0, int((node.get(self._tag("val")) or "").strip()))
+        except ValueError:
+            return 0
+
+    def _cell_text(self, container: ET.Element) -> tuple[str, list[bool]]:
         parts: list[str] = []
+        quotes: list[bool] = []
         for child in container:
             local = _local_name(child.tag)
             if local == "p":
                 text = self._flatten(self._inline_text(child))
                 if text:
                     parts.append(text)
+                    quotes.append(self._quoted_paragraph(child, text))
             elif local == "tbl":
                 self.add_table(child)
             elif local in {"tcPr", "trPr", "tblPr", "tblGrid"}:
                 continue
             else:
-                nested = self._cell_text(child)
+                nested, nested_quotes = self._cell_text(child)
                 if nested:
                     parts.append(nested)
-        return " ".join(parts)
+                    quotes.extend(nested_quotes)
+        return " ".join(parts), quotes
 
     def add_table(self, table: ET.Element) -> None:
         self._table_index += 1
         table_id = f"T#{self._table_index}"
         row_index = 0
-        for row in self._children(table, "tr"):
+        for row in self._descend(table, {"tr"}):
             row_index += 1
             if self._deleted_row(row):
                 continue
-            cells = tuple(self._cell_text(cell) for cell in self._children(row, "tc"))
+            before = self._grid_offset(row, "gridBefore")
+            after = self._grid_offset(row, "gridAfter")
+            texts: list[str] = []
+            roles: list[str] = []
+            for cell in self._descend(row, {"tc"}):
+                text, quotes = self._cell_text(cell)
+                texts.append(text)
+                roles.append("引文" if quotes and all(quotes) else "")
+            cells = ("",) * before + tuple(texts) + ("",) * after
+            cell_roles = ("",) * before + tuple(roles) + ("",) * after
             if not any(cells):
                 continue
             kind = "table_header" if self._header_row(row, row_index) else "table_row"
             self.segments.append(
-                Segment(f"{table_id} R#{row_index}", kind, " | ".join(cells), cells, table_id)
+                Segment(
+                    f"{table_id} R#{row_index}",
+                    kind,
+                    " | ".join(cells),
+                    cells,
+                    table_id,
+                    cell_roles=cell_roles,
+                )
             )
 
     def walk(self, container: ET.Element) -> None:
@@ -446,8 +524,14 @@ def parse_docx(path: Path) -> list[Segment]:
 
     root = ET.fromstring(payload)
     root_name = _local_name(root.tag)
+    namespace = _namespace(root.tag)
     if root_name != "document":
         raise ValueError(f"invalid main document root <{root_name}>; expected w:document")
+    if namespace not in WORD_NAMESPACES:
+        raise ValueError(
+            f"invalid main document namespace <{namespace or '(none)'}>; "
+            "expected the transitional or strict WordprocessingML namespace"
+        )
 
     body = None
     for child in root:
@@ -456,8 +540,13 @@ def parse_docx(path: Path) -> list[Segment]:
             break
     if body is None:
         raise ValueError("missing w:body in word/document.xml")
+    if _namespace(body.tag) != namespace:
+        raise ValueError(
+            f"w:body namespace <{_namespace(body.tag) or '(none)'}> "
+            f"does not match the main document namespace <{namespace}>"
+        )
 
-    reader = _DocxReader(_namespace(root.tag))
+    reader = _DocxReader(namespace)
     reader.walk(body)
     return reader.segments
 
@@ -497,16 +586,41 @@ def _metaphor_snippets(text: str) -> list[str]:
     return snippets
 
 
-def _evidence_snippets(text: str, legend: dict[str, str]) -> list[str]:
+@dataclass(frozen=True)
+class LegendEntry:
+    """One rating value together with the meaning a legend gives it."""
+
+    value: str
+    meaning: str
+    metric: str = ""
+
+
+def _legend_metric(*texts: str) -> str:
+    """Return which indicator a legend describes: 取证, another indicator, or unspecified."""
+
+    joined = " ".join(text for text in texts if text)
+    if EVIDENCE_METRIC_RE.search(joined):
+        return "取证"
+    if OTHER_METRIC_RE.search(joined):
+        return "非取证指标"
+    return ""
+
+
+def _covers_rating(entries: list[LegendEntry], value: str) -> bool:
+    meanings = {entry.meaning for entry in entries if entry.value == value and entry.metric in {"", "取证"}}
+    return len(meanings) == 1
+
+
+def _evidence_snippets(text: str, entries: list[LegendEntry]) -> list[str]:
     snippets: list[str] = []
     for match in EVIDENCE_RATING_RE.finditer(text):
         token = match.group(0)
         if EVIDENCE_DIRECTION_RE.search(token):
             continue
         rating = match.group(1)
-        if legend:
-            if rating in legend:
-                continue
+        if _covers_rating(entries, rating):
+            continue
+        if entries:
             snippets.append(f"方向不明取证评级: {token}（图例未覆盖该值，向委托人核对）")
             continue
         snippets.append(
@@ -533,7 +647,9 @@ def _syntax_snippets(text: str) -> list[str]:
     return snippets
 
 
-def _category_hits(text: str, legend: dict[str, str], *, syntax: bool) -> list[tuple[str, str]]:
+def _category_hits(
+    text: str, entries: list[LegendEntry], *, syntax: bool
+) -> list[tuple[str, str]]:
     hits: list[tuple[str, str]] = []
     for snippet in _metaphor_snippets(text):
         hits.append(("伪专业隐喻", snippet))
@@ -541,7 +657,7 @@ def _category_hits(text: str, legend: dict[str, str], *, syntax: bool) -> list[t
         hits.append(("英文直译腔", f"{match.group(0)} ({_clip(text, 55)})"))
     for match in BUREAUCRATIC_BLOAT_RE.finditer(text):
         hits.append(("空泛管理堆砌", f"{match.group(0)} ({_clip(text, 55)})"))
-    for snippet in _evidence_snippets(text, legend):
+    for snippet in _evidence_snippets(text, entries):
         hits.append(("表头或格内压缩失义", snippet))
     if syntax:
         for snippet in _syntax_snippets(text):
@@ -576,33 +692,54 @@ def _protected_columns(segments: list[Segment]) -> dict[str, set[int]]:
     return protected
 
 
-def _collect_legend(segments: list[Segment]) -> dict[str, str]:
-    legend: dict[str, str] = {}
-    legend_tables: set[str] = set()
+def _table_legends(segments: list[Segment]) -> dict[str, dict[int, list[LegendEntry]]]:
+    """Pair a rating with its meaning in the same row and under the relevant column."""
+    tables: dict[str, list[Segment]] = defaultdict(list)
+    captions: dict[str, str] = {}
+    previous = ""
     for seg in segments:
-        for match in LEGEND_INLINE_RE.finditer(seg.text):
-            legend.setdefault(match.group(1), match.group(2))
-        if (
-            seg.kind == "table_header"
-            and seg.table
-            and any(LEGEND_HEADER_RE.search(cell) for cell in seg.cells)
-        ):
-            legend_tables.add(seg.table)
+        if seg.table:
+            if seg.table not in tables:
+                captions[seg.table] = previous if "表" in previous and len(previous) <= 40 else ""
+            tables[seg.table].append(seg)
+        previous = seg.text if seg.editable else ""
 
-    for seg in segments:
-        if seg.kind not in {"table_header", "table_row"} or seg.table not in legend_tables:
-            continue
-        for index, cell in enumerate(seg.cells):
-            key = cell.strip()
-            if key not in {"高", "中", "低"}:
+    result = {}
+    for table, rows in tables.items():
+        headers = {i: cell for row in rows if row.kind == "table_header"
+                   for i, cell in enumerate(row.cells) if cell.strip()}
+        meaning_columns = [i for i, header in headers.items() if re.search(r"含义|定义|释义|图例", header)]
+        entries: dict[int, list[LegendEntry]] = defaultdict(list)
+        for row in rows:
+            if row.kind != "table_row":
                 continue
-            for other_index, other in enumerate(seg.cells):
-                if other_index == index:
+            for index, raw in enumerate(row.cells):
+                value = raw.strip()
+                if value not in RATING_VALUE_SET or (index < len(row.cell_roles) and row.cell_roles[index]):
                     continue
-                meaning = LEGEND_MEANING_RE.search(other)
-                if meaning:
-                    legend.setdefault(key, meaning.group(0))
-    return legend
+                # When several ratings share a table, only the following meaning column belongs to this value.
+                columns = [i for i in meaning_columns if i == index + 1]
+                if len(meaning_columns) == 1 and len(headers) == 2:
+                    columns = [i for i in meaning_columns if i != index]
+                for col in columns:
+                    if col >= len(row.cells) or (col < len(row.cell_roles) and row.cell_roles[col]):
+                        continue
+                    meaning = LEGEND_MEANING_RE.search(row.cells[col])
+                    if meaning:
+                        metric = _legend_metric(headers.get(index, "")) or _legend_metric(captions[table])
+                        entries[index].append(LegendEntry(value, meaning.group(), metric))
+        result[table] = entries
+    return result
+
+
+def _ambiguous_column_rating(cell: str, header: str) -> bool:
+    """A bare 高/中/低 cell under an evidence-rating column with no stated direction."""
+
+    if cell.strip() not in RATING_VALUE_SET:
+        return False
+    if not EVIDENCE_METRIC_RE.search(header):
+        return False
+    return not EVIDENCE_DIRECTION_RE.search(header)
 
 
 def _scan_segment(
@@ -610,7 +747,7 @@ def _scan_segment(
     *,
     editable: bool,
     role: str,
-    legend: dict[str, str],
+    entries: list[LegendEntry],
     syntax: bool,
     column: int = 0,
     findings: list[Finding],
@@ -618,7 +755,7 @@ def _scan_segment(
 ) -> None:
     suffix = f"（第{column}列）" if column else ""
     masked, literals = _split_inline_code(seg.text)
-    for category, snippet in _category_hits(masked, legend, syntax=syntax):
+    for category, snippet in _category_hits(masked, entries, syntax=syntax):
         if editable:
             findings.append(
                 Finding(category, seg.location, f"{snippet}{suffix}", role, CATEGORY_ACTIONS[category])
@@ -627,7 +764,7 @@ def _scan_segment(
             disclose(seg.location, f"{snippet}{suffix}", role)
 
     for literal in literals:
-        for category, snippet in _category_hits(literal, legend, syntax=False):
+        for category, snippet in _category_hits(literal, entries, syntax=False):
             disclose(seg.location, f"{snippet}{suffix}", "原字段值（行内代码）")
 
 
@@ -636,145 +773,67 @@ def _location_key(location: str):
     return tuple((0, int(part)) if part.isdigit() else (1, part) for part in parts if part)
 
 
-def _normalize(text: str) -> str:
-    return re.sub(r"\s+", "", text)
-
-
-def _fact_signature(text: str) -> tuple[str, ...]:
-    return tuple(FACT_RE.findall(text))
-
-
-def _fact_preview(text: str, limit: int = 42) -> str:
-    facts = FACT_RE.findall(text)
-    if not facts:
-        return "无数字或型号差异"
-    return _clip("/".join(facts), limit)
-
-
 def _check_repetitions(
     segments: list[Segment],
     protected: dict[str, set[int]],
     findings: list[Finding],
     disclose,
 ) -> None:
-    units: list[tuple[str, str]] = []
+    occurrences: dict[str, set[str]] = defaultdict(set)
     for seg in segments:
-        if seg.kind in ("blockquote", "table_header"):
-            continue
         if seg.kind == "table_row":
-            blocked = protected.get(seg.table, set())
-            for index, cell in enumerate(seg.cells):
-                if cell and index not in blocked:
-                    units.append((seg.location, cell))
-        elif seg.editable:
-            units.append((seg.location, seg.text))
-
-    window_locations: dict[str, set[str]] = defaultdict(set)
-    unit_data: list[tuple[str, str, str, list[int]]] = []
-
-    for location, raw in units:
-        cleaned = URL_RE.sub("", raw)
-        cjk_chars: list[str] = []
-        positions: list[int] = []
-        for index, char in enumerate(cleaned):
-            if CJK_RE.match(char):
-                cjk_chars.append(char)
-                positions.append(index)
-        cjk_text = "".join(cjk_chars)
-        if len(cjk_text) < REPEAT_CJK_WINDOW:
+            cells = [
+                cell for index, cell in enumerate(seg.cells)
+                if index not in protected.get(seg.table, set())
+                and not (index < len(seg.cell_roles) and seg.cell_roles[index])
+            ]
+        elif seg.editable and seg.kind not in {"blockquote", "table_header"}:
+            cells = [seg.text]
+        else:
             continue
-        unit_data.append((location, cleaned, cjk_text, positions))
-        seen_local: set[str] = set()
-        for start in range(len(cjk_text) - REPEAT_CJK_WINDOW + 1):
-            window = cjk_text[start : start + REPEAT_CJK_WINDOW]
-            if window not in seen_local:
-                seen_local.add(window)
-                window_locations[window].add(location)
+        for cell in cells:
+            if cell.strip():
+                occurrences[cell.strip()].add(seg.location)
 
-    repeated = {
-        window: frozenset(locations)
-        for window, locations in window_locations.items()
-        if len(locations) >= REPEAT_MIN_LOCATIONS
-    }
-
-    groups: dict[tuple[frozenset[str], str], dict[str, str]] = {}
-    if repeated:
-        for location, cleaned, cjk_text, positions in unit_data:
-            index = 0
-            length = len(cjk_text)
-            while index <= length - REPEAT_CJK_WINDOW:
-                locations = repeated.get(cjk_text[index : index + REPEAT_CJK_WINDOW])
-                if locations is None:
-                    index += 1
-                    continue
-                end = index + 1
-                while (
-                    end <= length - REPEAT_CJK_WINDOW
-                    and repeated.get(cjk_text[end : end + REPEAT_CJK_WINDOW]) == locations
-                ):
-                    end += 1
-                end_cjk = end - 1 + REPEAT_CJK_WINDOW
-                slice_text = cleaned[positions[index] : positions[end_cjk - 1] + 1]
-                key = (locations, FACT_RE.sub("·", slice_text))
-                bucket = groups.setdefault(key, {})
-                if location not in bucket or len(slice_text) > len(bucket[location]):
-                    bucket[location] = slice_text
-                index = end
-
-    verbatim: dict[str, set[str]] = defaultdict(set)
-    for location, cleaned, _cjk_text, _positions in unit_data:
-        verbatim[_normalize(cleaned)].add(location)
-
-    reported: set[tuple[str, str]] = set()
-    for (locations, _mask), bucket in groups.items():
+    # 用汉字窗口找相似句；删除候选须核对含限定、行内原值和来源的完整原句。
+    windows: dict[str, set[str]] = defaultdict(set)
+    without_urls: dict[str, set[str]] = defaultdict(set)
+    for raw, locations in occurrences.items():
+        prose, _ = _split_inline_code(raw)
+        body = URL_RE.sub("", prose)
+        chars = "".join(CJK_RE.findall(body))
+        if len(chars) < REPEAT_CJK_WINDOW:
+            continue
+        for index in range(len(chars) - REPEAT_CJK_WINDOW + 1):
+            windows[chars[index:index + REPEAT_CJK_WINDOW]].add(raw)
+        without_urls[URL_RE.sub("", raw)].add(raw)
         ordered = sorted(locations, key=_location_key)
-        preview = ", ".join(ordered[:5])
-        if len(ordered) > 5:
-            preview += f" 等{len(ordered)}处"
-        slices = [bucket.get(location, "") for location in ordered]
-        signatures = [_fact_signature(text) for text in slices]
-        if len(set(signatures)) == 1:
-            key = (frozenset(ordered), _normalize(slices[0]))
-            if key in reported:
-                continue
-            reported.add(key)
-            findings.append(
-                Finding(
-                    "跨段长句复读",
-                    f"{len(ordered)}x [{preview}]",
-                    _clip(slices[0], 65),
-                    "跨段",
-                    CATEGORY_ACTIONS["跨段长句复读"],
-                )
-            )
-            continue
+        if len(ordered) >= REPEAT_TWO_PLACE_LIMIT:
+            two = len(ordered) == REPEAT_TWO_PLACE_LIMIT
+            findings.append(Finding(
+                "跨段长句复读", f"{len(ordered)}x [{', '.join(ordered)}]",
+                _clip(raw, 65) + ("（两处逐字相同）" if two else ""), "跨段",
+                "两处逐字相同，先确认用途再决定是否合并" if two else CATEGORY_ACTIONS["跨段长句复读"],
+            ))
 
-        differences = " ｜ ".join(
-            f"{location}: {_fact_preview(text)}" for location, text in zip(ordered, slices)
-        )
-        disclose(
-            f"{len(ordered)}x 相近句式 [{preview}]",
-            f"事实不同，不可并作删除重复 ｜ {differences}",
-            "相近句式",
-        )
+    groups = {frozenset(texts) for texts in windows.values() if len(texts) > 1}
+    for texts in sorted(groups, key=sorted):
+        locations = sorted(set().union(*(occurrences[t] for t in texts)), key=_location_key)
+        if len(locations) < REPEAT_MIN_LOCATIONS:
+            continue
+        details = []
+        for text in sorted(texts, key=lambda t: (min(map(_location_key, occurrences[t])), t)):
+            facts = "/".join(FACT_RE.findall(text))
+            places = ", ".join(sorted(occurrences[text], key=_location_key))
+            details.append(f"{places}: {_clip(text, 48)} {facts}".rstrip())
+        disclose(f"{len(locations)}x 相近句式 [{', '.join(locations)}]",
+                 "原句或事实不同，不可并作删除重复 ｜ " + " ｜ ".join(details), "相近句式")
 
-    for text, locations in verbatim.items():
-        if len(locations) != REPEAT_TWO_PLACE_LIMIT:
-            continue
-        ordered = sorted(locations, key=_location_key)
-        key = (frozenset(ordered), text)
-        if key in reported:
-            continue
-        reported.add(key)
-        findings.append(
-            Finding(
-                "跨段长句复读",
-                f"{REPEAT_TWO_PLACE_LIMIT}x [{', '.join(ordered)}]",
-                f"{_clip(text, 65)}（两处逐字相同）",
-                "跨段",
-                "两处逐字相同，先确认用途再决定是否合并",
-            )
-        )
+    for body, variants in without_urls.items():
+        if len(variants) > 1:
+            locations = sorted(set().union(*(occurrences[t] for t in variants)), key=_location_key)
+            disclose(f"正文相同来源不同 [{', '.join(locations)}]",
+                     f"{_clip(body, 45)} ｜ 来源不同，逐处核对。", "跨段")
 
 
 def analyze_file(path: Path) -> FileReport:
@@ -798,27 +857,50 @@ def analyze_file(path: Path) -> FileReport:
         disclosures.append(Disclosure(location, text, role))
 
     protected = _protected_columns(segments)
-    legend = _collect_legend(segments)
+    table_legends = _table_legends(segments)
+    prose_entries: list[LegendEntry] = []
+    previous_table = ""
+    table_headers: dict[str, dict[int, str]] = defaultdict(dict)
+    for seg in segments:
+        if seg.kind != "table_header" or not seg.table:
+            continue
+        for index, cell in enumerate(seg.cells):
+            if cell.strip():
+                prior = table_headers[seg.table].get(index, "")
+                table_headers[seg.table][index] = f"{prior} {cell.strip()}".strip()
 
     for seg in segments:
         if seg.kind in {"table_header", "table_row"}:
             blocked = protected.get(seg.table, set())
+            if previous_table and previous_table != seg.table:
+                prose_entries = []
+            previous_table = seg.table
+            headers = table_headers.get(seg.table, {})
             for index, cell in enumerate(seg.cells):
-                if not cell:
+                if not cell.strip():
                     continue
-                is_protected = seg.kind == "table_row" and index in blocked
-                role = (
-                    "表头"
-                    if seg.kind == "table_header"
-                    else ("原表值" if is_protected else "表值·来源需判定")
+                entries = prose_entries + table_legends[seg.table].get(index, [])
+                cell_role = seg.cell_roles[index] if index < len(seg.cell_roles) else ""
+                is_protected = seg.kind == "table_row" and (
+                    index in blocked or cell_role == "引文"
                 )
-                cell_segment = Segment(seg.location, seg.kind, cell, table=seg.table)
+                if seg.kind == "table_header":
+                    role = "表头"
+                elif cell_role:
+                    role = cell_role
+                elif index in blocked:
+                    role = "原表值"
+                else:
+                    role = "表值·来源需判定"
+                cell_segment = Segment(
+                    seg.location, seg.kind, cell, table=seg.table, editable=not is_protected
+                )
                 column = index + 1 if seg.kind == "table_row" else 0
                 _scan_segment(
                     cell_segment,
                     editable=not is_protected,
                     role=role,
-                    legend=legend,
+                    entries=entries,
                     syntax=False,
                     column=column,
                     findings=findings,
@@ -836,7 +918,8 @@ def analyze_file(path: Path) -> FileReport:
                             )
                         )
                 elif not is_protected:
-                    if CELL_PACKED_RE.search(cell):
+                    masked_cell, _literals = _split_inline_code(cell)
+                    if CELL_PACKED_RE.search(masked_cell):
                         findings.append(
                             Finding(
                                 "表头或格内压缩失义",
@@ -846,7 +929,7 @@ def analyze_file(path: Path) -> FileReport:
                                 CATEGORY_ACTIONS["表头或格内压缩失义"],
                             )
                         )
-                    cleaned = SLASH_EXCLUDE_RE.sub("", cell)
+                    cleaned = SLASH_EXCLUDE_RE.sub("", masked_cell)
                     if len(re.findall(r"[／/]", cleaned)) >= 2:
                         findings.append(
                             Finding(
@@ -857,13 +940,40 @@ def analyze_file(path: Path) -> FileReport:
                                 CATEGORY_ACTIONS["表头或格内压缩失义"],
                             )
                         )
+                    header = headers.get(index, "")
+                    if _ambiguous_column_rating(cell, header) and not _covers_rating(
+                        entries, cell.strip()
+                    ):
+                        findings.append(
+                            Finding(
+                                "表头或格内压缩失义",
+                                seg.location,
+                                f"方向不明取证评级: {cell.strip()}（第{column}列，"
+                                f"表头「{_clip(header, 20)}」未给方向，图例未覆盖该值，向委托人核对）",
+                                role,
+                                CATEGORY_ACTIONS["表头或格内压缩失义"],
+                            )
+                        )
             continue
+
+        if previous_table:
+            # A standalone rating key may define the prose immediately following it.
+            prose_entries = [entry for values in table_legends[previous_table].values() for entry in values]
+            previous_table = ""
+        if seg.kind == "heading" or re.match(r"^表(?:[A-Z0-9一二三四五六七八九十]+)(?:[ \u3000]|$)", seg.text):
+            prose_entries = []
+        if seg.editable:
+            clean, _ = _split_inline_code(seg.text)
+            definitions = [LegendEntry(m[1], m[2], _legend_metric(clean))
+                           for m in LEGEND_INLINE_RE.finditer(clean)]
+            if definitions:
+                prose_entries = definitions
 
         _scan_segment(
             seg,
             editable=seg.editable,
             role=_protection_reason(seg),
-            legend=legend,
+            entries=prose_entries,
             syntax=seg.kind == "prose",
             findings=findings,
             disclose=disclose,
@@ -913,7 +1023,11 @@ def print_report(report: FileReport) -> None:
 
     for cat in CATEGORY_ORDER:
         items = by_cat.get(cat, [])
-        note = "（阈值：3处及以上；另提示两处逐字相同）" if cat == "跨段长句复读" else ""
+        note = (
+            "（阈值：3处及以上；另提示两处逐字相同）"
+            if cat == "跨段长句复读" and items
+            else ""
+        )
         print(f"[{cat}] {len(items)} 处{note}")
         for item in items:
             extra = f"｜{item.role}｜建议：{item.action}" if item.action else ""

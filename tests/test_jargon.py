@@ -33,6 +33,32 @@ def table(*rows: str) -> str:
     return "<w:tbl><w:tblPr/><w:tblGrid><w:gridCol/></w:tblGrid>" + "".join(rows) + "</w:tbl>"
 
 
+def cell(content: str) -> str:
+    return f"<w:tc>{content}</w:tc>"
+
+
+def row_of(*cells: str, before: int = 0) -> str:
+    properties = f'<w:trPr><w:gridBefore w:val="{before}"/></w:trPr>' if before else ""
+    return f"<w:tr>{properties}{''.join(cells)}</w:tr>"
+
+
+def grid_table(columns: int, *rows: str) -> str:
+    return (
+        "<w:tbl><w:tblPr/><w:tblGrid>"
+        + "<w:gridCol/>" * columns
+        + "</w:tblGrid>"
+        + "".join(rows)
+        + "</w:tbl>"
+    )
+
+
+def content_control(element: str, identifier: int) -> str:
+    return (
+        f'<w:sdt><w:sdtPr><w:id w:val="{identifier}"/></w:sdtPr>'
+        f"<w:sdtContent>{element}</w:sdtContent></w:sdt>"
+    )
+
+
 def build_docx_root(directory: Path, root_xml: str, filename: str = "sample.docx") -> Path:
     path = directory / filename
     with zipfile.ZipFile(path, "w") as archive:
@@ -249,6 +275,25 @@ class JargonScannerTests(unittest.TestCase):
         self.assertIn("2x [L1, L3]", result.stdout)
         self.assertIn("两处逐字相同", result.stdout)
 
+    def test_shared_wording_keeps_different_companies_and_cells_separate(self):
+        statement = "对公开登记资料进行核对后，将涉及的权利要求按设备部件和使用条件分别记录。"
+        rows = "".join(f"| {name}：{statement} | 同一栏位 |\n" for name in ("甲公司", "乙公司", "丙公司"))
+        result = self.scan_text("| 核查记录 | 备注 |\n| --- | --- |\n" + rows)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        for name in ("甲公司", "乙公司", "丙公司"):
+            self.assertIn(name, result.stdout)
+
+    def test_rating_definition_cannot_move_across_columns_or_sections(self):
+        cases = (
+            "| 研发等级 | 研发含义 | 取证难易 |\n| --- | --- | --- |\n| 高 | 较难 | 高 |",
+            "# 甲表\n本表取证等级定义为高＝较难。\n\n# 乙表\n侵权取证：高。",
+        )
+        for content in cases:
+            with self.subTest(content=content):
+                result = self.scan_text(content)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("方向不明取证评级", result.stdout)
+
     def test_repetition_keeps_distinct_facts_apart(self):
         paragraphs = [
             f"截至{year}年核对公开数据库登记的A-{model}型设备涉及的证据，专利申请为{amount}件"
@@ -329,6 +374,198 @@ class JargonScannerTests(unittest.TestCase):
         result = self.scan("--strict", path)
         self.assertEqual(result.returncode, 2)
         self.assertIn("ERROR", result.stderr)
+
+    def test_legends_only_cover_their_own_table_and_indicator(self):
+        cross_table = (
+            "表A　研发实施难度\n\n| 难度等级 | 含义 |\n| --- | --- |\n| 高 | 较难 |\n\n"
+            "表B　外部取证（未附图例）\n\n| 案例 | 评分 |\n| --- | --- |\n"
+            "| 电机方案 | 侵权取证：高 |\n"
+        )
+        quoted_legend = (
+            "> 对方的取证难度等级定义：高＝较难。\n\n"
+            "本报告采用独立评级，材料未附图例。\n\n侵权取证：高。\n"
+        )
+        for label, content, location in (
+            ("cross-table legend", cross_table, "L11"),
+            ("quoted legend", quoted_legend, "L5"),
+            ("no legend at all", "侵权取证：高。\n", "L1"),
+        ):
+            with self.subTest(case=label):
+                result = self.scan_text(content, name=f"{label}.md")
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(f"{location}: 方向不明取证评级: 侵权取证：高", result.stdout)
+
+        own_table_legend = (
+            "| 案例 | 取证难易 | 含义 |\n| --- | --- | --- |\n| 电机方案 | 高 | 较难 |\n"
+        )
+        result = self.scan_text(own_table_legend, name="own_table_legend.md")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("方向不明取证评级", result.stdout)
+
+    def test_rating_columns_report_the_direction_they_lack(self):
+        ambiguous = (
+            ("| 案例 | 取证难易 |\n| --- | --- |\n| 电机方案 | 高 |\n", "rating_table.md", "L3"),
+            ("电机方案的取证难易程度：高。\n", "rating_inline.md", "L1"),
+        )
+        for content, name, location in ambiguous:
+            with self.subTest(case=name):
+                result = self.scan_text(content, name=name)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(f"{location}: 方向不明取证评级", result.stdout)
+
+        directed = (
+            "| 案例 | 取证难度 |\n| --- | --- |\n| 电机方案 | 高 |\n\n"
+            "电机方案的侵权取证难度较高。\n"
+        )
+        result = self.scan_text(directed, name="rating_directed.md")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("方向不明取证评级", result.stdout)
+
+    def test_repetition_keeps_leading_dates_and_qualifiers_apart(self):
+        dates = [
+            f"{year}年核对公开登记后，将所涉专利申请按申请人和技术主题分别统计，并在表后记录公开日期。"
+            for year in (2023, 2024, 2025)
+        ]
+        result = self.scan_text("\n\n".join(dates), name="leading_dates.md")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(findings(result.stdout), [])
+        kept = "\n".join(protected(result.stdout))
+        self.assertIn("事实不同", kept)
+        for token in ("2023", "2024", "2025"):
+            self.assertIn(token, kept)
+
+        description = (
+            "外壳连接件在压接工艺的全部工位均采用独立编号并在投产记录中保存检验时间和操作人信息。"
+        )
+        paragraphs = [
+            prefix + description
+            for prefix in ("已经核实", "尚未核实", "仅在样机条件下确认")
+        ]
+        result = self.scan_text("\n\n".join(paragraphs), name="leading_qualifiers.md")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(findings(result.stdout), [])
+        self.assertIn("事实不同", "\n".join(protected(result.stdout)))
+
+    def test_two_places_with_different_sources_are_not_verbatim_repeats(self):
+        opening = "项目组在检测报告中逐项记录样机的外壳卡扣数量、连接位置、检验时间和操作工位，见 "
+        content = "\n\n".join(
+            f"{opening}https://example.com/materials/{key}" for key in ("sample-a", "sample-b")
+        )
+        result = self.scan_text(content, name="distinct_sources.md")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("两处逐字相同", result.stdout)
+        self.assertIn("来源不同", "\n".join(protected(result.stdout)))
+
+    def test_blockquote_continuation_line_stays_a_quotation(self):
+        content = (
+            "> 引用合同条款时请保留其如下约定，\n"
+            "权利底座的使用范围由双方在附件中确认。\n\n"
+            "报告初稿使用了质量体检一词。\n"
+        )
+        result = self.scan_text(content, name="quote_continuation.md")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("L4: 质量体检", "\n".join(findings(result.stdout)))
+        self.assertNotIn("权利底座", "\n".join(findings(result.stdout)))
+        self.assertIn("L2: 权利底座", "\n".join(protected(result.stdout)))
+
+    def test_inline_code_in_cells_and_repeated_literals_stay_protected(self):
+        tick = "`"
+        result = self.scan_text(
+            f"| 字段 | 校验指令示例 |\n| --- | --- |\n| 名称 | {tick}宽保护核心/标签组/输出字段{tick} |\n",
+            name="code_cell.md",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(findings(result.stdout), [])
+
+        description = (
+            "外壳连接件在压接工艺的全部工位均采用独立编号并在投产记录中保存检验时间和操作人信息。"
+        )
+        repeated = "\n\n".join(
+            f"附录字段{ordinal}照录 {tick}{description}{tick}" for ordinal in ("甲", "乙", "丙")
+        )
+        result = self.scan_text(repeated, name="code_repeat.md")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(findings(result.stdout), [])
+
+    def test_fence_is_closed_only_by_an_unindented_marker(self):
+        fence = "```"
+        content = f"{fence}text\n    {fence}\n值示例：质量体检\n{fence}\n\n评分画像应核对。\n"
+        result = self.scan_text(content, name="fence_indent.md")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        output = "\n".join(findings(result.stdout))
+        self.assertIn("L6: 评分画像", output)
+        self.assertNotIn("质量体检", output)
+
+    def test_docx_content_controls_around_rows_and_cells_keep_visible_text(self):
+        header = row_of(cell(paragraph("项目")), cell(paragraph("说明")))
+        wrapped_row = content_control(
+            row_of(cell(paragraph("检索记录")), cell(paragraph("质量体检需要改。"))), 1
+        )
+        wrapped_cell = row_of(
+            cell(paragraph("比对摘要")), content_control(cell(paragraph("权利底座需要改。")), 2)
+        )
+        path = build_docx_body(
+            self.temporary_directory(),
+            grid_table(2, header, wrapped_row, wrapped_cell),
+        )
+        result = self.scan("--strict", path)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        output = "\n".join(findings(result.stdout))
+        self.assertIn("T#1 R#2: 质量体检", output)
+        self.assertIn("T#1 R#3: 权利底座", output)
+
+    def test_docx_quote_paragraph_inside_a_cell_is_protected(self):
+        quotation = paragraph(
+            "权利底座的使用范围以合同附件为准。", '<w:pPr><w:pStyle w:val="Quote"/></w:pPr>'
+        )
+        body = (
+            quotation
+            + grid_table(
+                2,
+                row_of(cell(paragraph("条款")), cell(paragraph("说明"))),
+                row_of(cell(paragraph("条款原文")), cell(quotation)),
+            )
+            + paragraph("质量体检的名称需核实。")
+        )
+        path = build_docx_body(self.temporary_directory(), body)
+        result = self.scan("--strict", path)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("T#1 R#2: 权利底座", "\n".join(protected(result.stdout)))
+        self.assertNotIn("T#1 R#2: 权利底座", "\n".join(findings(result.stdout)))
+        self.assertIn("P#2: 质量体检", "\n".join(findings(result.stdout)))
+
+    def test_docx_grid_before_row_keeps_column_roles(self):
+        body = grid_table(
+            3,
+            row_of(
+                cell(paragraph("主题")),
+                cell(paragraph("原字段值")),
+                cell(paragraph("编辑建议")),
+            ),
+            row_of(cell(paragraph("权利底座")), cell(paragraph("质量体检")), before=1),
+        )
+        path = build_docx_body(self.temporary_directory(), body)
+        result = self.scan("--strict", path)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        rows = findings(result.stdout)
+        self.assertEqual(len(rows), 1, rows)
+        self.assertIn("T#1 R#2: 质量体检", rows[0])
+        self.assertIn("（第3列）", rows[0])
+        kept = protected(result.stdout)
+        self.assertTrue(
+            any("T#1 R#2: 权利底座" in line and "（第2列）" in line for line in kept), kept
+        )
+
+    def test_docx_foreign_namespace_root_is_rejected(self):
+        path = build_docx_body(
+            self.temporary_directory(),
+            paragraph("说明普通资料。"),
+            namespace="urn:unrelated",
+        )
+        result = self.scan("--strict", path)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("ERROR", result.stderr)
+        self.assertNotIn("CJK=", result.stdout)
 
 
 if __name__ == "__main__":
