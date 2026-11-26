@@ -232,7 +232,7 @@ class JargonScannerTests(unittest.TestCase):
     def test_ipc_and_enumeration_cells_are_not_packed_columns(self):
         content = (
             "| 分组口径 | 样例 |\n| --- | --- |\n"
-            "| H01L21/67／H01L21/68 | 有效／审中／终止 |\n"
+            "| H01L21/67／H01L21/68／B65D 81/02 | 有效／审中／终止 |\n"
             "| 外围／细化／低 | 待核 |\n"
             "| H/M/N/D | S/A/B |\n"
         )
@@ -242,6 +242,11 @@ class JargonScannerTests(unittest.TestCase):
         self.assertIn("L4: 拼栏格值", output)
         for location in ("L3:", "L5:"):
             self.assertNotIn(location, output)
+
+    def test_blockquote_with_pipe_ends_a_table(self):
+        result = self.scan_text("| 自编说明 |\n| --- |\n| 普通说明 |\n> 权利底座 | 引用内容")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("L4: 权利底座", "\n".join(protected(result.stdout)))
 
     def test_original_value_column_is_protected_while_unknown_table_is_marked(self):
         original = "| 项目 | 原字段值 |\n| --- | --- |\n| 标签 | 权利底座 |\n"
@@ -614,6 +619,25 @@ class JargonScannerTests(unittest.TestCase):
         self.assertTrue(
             any("T#1 R#2: 权利底座" in line and "（第2列）" in line for line in kept), kept
         )
+
+    def test_inherited_hidden_styles_match_visible_word_runs(self):
+        styles = (
+            '<w:style w:type="paragraph" w:styleId="Archive"><w:rPr><w:vanish/></w:rPr></w:style>'
+            '<w:style w:type="character" w:styleId="Source"><w:rPr><w:vanish/></w:rPr></w:style>'
+            '<w:style w:type="character" w:styleId="Child"><w:basedOn w:val="Source"/></w:style>'
+        )
+        body = ('<w:p><w:r><w:rPr><w:rStyle w:val="Child"/></w:rPr><w:t>权利底座</w:t></w:r></w:p>'
+                '<w:p><w:pPr><w:pStyle w:val="Archive"/></w:pPr><w:r><w:t>评分画像</w:t></w:r>'
+                '<w:r><w:rPr><w:vanish w:val="0"/></w:rPr><w:t>质量体检</w:t></w:r></w:p>')
+        for ns in (TRANSITIONAL_NAMESPACE, STRICT_NAMESPACE):
+            with self.subTest(ns=ns):
+                path = build_docx_body(self.temporary_directory(), body, namespace=ns)
+                with zipfile.ZipFile(path, "a") as archive:
+                    archive.writestr("word/styles.xml", f'<w:styles xmlns:w="{ns}">{styles}</w:styles>')
+                result = self.scan("--strict", path)
+                self.assertIn("CJK=4", result.stdout)
+                self.assertEqual(len(findings(result.stdout)), 1)
+                self.assertIn("质量体检", findings(result.stdout)[0])
 
     def test_docx_foreign_namespace_root_is_rejected(self):
         path = build_docx_body(

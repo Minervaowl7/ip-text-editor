@@ -77,9 +77,10 @@ BUREAUCRATIC_BLOAT_RE = re.compile(
 
 HEADER_PACKED_RE = re.compile(r"角色\s*[／/]\s*取证")
 CELL_PACKED_RE = re.compile(r"宽保护核心|互补保护|外围\s*[／/]\s*细化")
+IPC_CODE_PATTERN = r"[A-H]\d{2}[A-Z]\s*\d+(?:\s*[／/]\s*\d+)?"
 SLASH_EXCLUDE_RE = re.compile(
     r"https?://\S+|总件数／有效／审中|S/A/B|GB/T|T/CIPS|Ⅰ／Ⅱ／Ⅲ|BOM/|"
-    r"[A-H]\d{2}[A-Z]\d+(?:[／/]\d+)?|"
+    rf"{IPC_CODE_PATTERN}(?:\s*[／/]\s*{IPC_CODE_PATTERN})*|"
     r"\b[A-Z](?:[／/][A-Z])+\b|"
     r"有效[／/]审中[／/]终止|公开[／/]部分公开[／/]未公开|"
     r"\b\d+(?:[／/]\d+)+\b"
@@ -297,7 +298,8 @@ def parse_markdown_or_text(path: Path) -> list[Segment]:
             idx += 1
             continue
 
-        if "|" in stripped and idx + 1 < len(raw_lines) and _is_table_separator(raw_lines[idx + 1]):
+        table_line = "|" in stripped and not stripped.startswith(">") and not MD_HEADING_RE.match(stripped)
+        if table_line and idx + 1 < len(raw_lines) and _is_table_separator(raw_lines[idx + 1]):
             table_counter += 1
             table_id = f"T#{table_counter}"
             cells = _split_md_cells(stripped)
@@ -307,7 +309,7 @@ def parse_markdown_or_text(path: Path) -> list[Segment]:
             idx += 2
             continue
 
-        if in_table and "|" in stripped:
+        if in_table and table_line:
             cells = _split_md_cells(stripped)
             segments.append(Segment(f"L{line_no}", "table_row", " | ".join(cells), cells, table_id))
             idx += 1
@@ -384,8 +386,21 @@ def _visible_children(element: ET.Element):
 class _DocxReader:
     """Collect the visible body in document order for one WordprocessingML namespace."""
 
-    def __init__(self, namespace: str) -> None:
+    def __init__(self, namespace: str, styles: ET.Element | None = None) -> None:
         self.ns = namespace
+        self.styles: dict[str, ET.Element] = {}
+        self.default_styles: dict[str, str] = {}
+        self.default_hidden = False
+        if styles is not None:
+            if styles.tag != self._tag("styles"):
+                raise ValueError("unexpected Word styles namespace or root")
+            for style in styles.findall(self._tag("style")):
+                style_id = style.get(self._tag("styleId"), "")
+                self.styles[style_id] = style
+                if style.get(self._tag("default"), "0").lower() in {"1", "true", "on"}:
+                    self.default_styles[style.get(self._tag("type"), "paragraph")] = style_id
+            defaults = styles.find("/".join(self._tag(k) for k in ("docDefaults", "rPrDefault", "rPr")))
+            self.default_hidden = bool(self._run_flag(defaults, "vanish"))
         self.segments: list[Segment] = []
         self._paragraph_index = 0
         self._table_index = 0
@@ -413,27 +428,46 @@ class _DocxReader:
                 found.extend(self._descend(child, names))
         return found
 
-    def _hidden_run(self, run: ET.Element) -> bool:
-        properties = self._child(run, "rPr")
-        if properties is None:
-            return False
-        for name in ("vanish", "specVanish"):
-            flag = self._child(properties, name)
-            if flag is None:
-                continue
-            value = (flag.get(self._tag("val")) or "").lower()
-            if value not in {"0", "false", "off"}:
-                return True
-        return False
+    def _run_flag(self, properties: ET.Element | None, name: str) -> bool | None:
+        node = properties.find(self._tag(name)) if properties is not None else None
+        return None if node is None else node.get(self._tag("val"), "1").lower() not in {"0", "false", "off"}
 
-    def _inline_text(self, element: ET.Element) -> str:
+    def _style_hidden(self, style_id: str, kind: str) -> bool:
+        style_id = style_id or self.default_styles.get(kind, "")
+        visited = set()
+        while style_id in self.styles and style_id not in visited:
+            visited.add(style_id)
+            style = self.styles[style_id]
+            if style.get(self._tag("type"), "paragraph") != kind:
+                break
+            hidden = self._run_flag(style.find(self._tag("rPr")), "vanish")
+            if hidden is not None:
+                return hidden
+            base = style.find(self._tag("basedOn"))
+            style_id = base.get(self._tag("val"), "") if base is not None else ""
+        return self.default_hidden
+
+    def _hidden_run(self, run: ET.Element, paragraph_hidden: bool) -> bool:
+        properties = self._child(run, "rPr")
+        if self._run_flag(properties, "specVanish"):
+            return True
+        direct = self._run_flag(properties, "vanish")
+        if direct is not None:
+            return direct
+        char_style = self._child(properties, "rStyle") if properties is not None else None
+        style_id = char_style.get(self._tag("val"), "") if char_style is not None else ""
+        # Word resolves the basedOn chain within each style level before combining levels.
+        character_hidden = self._style_hidden(style_id, "character")
+        return paragraph_hidden ^ character_hidden ^ self.default_hidden
+
+    def _inline_text(self, element: ET.Element, paragraph_hidden: bool) -> str:
         parts: list[str] = []
         for child in _visible_children(element):
             local = _local_name(child.tag)
             if local in {"del", "moveFrom", "delText"}:
                 continue
             if local == "r":
-                if self._hidden_run(child):
+                if self._hidden_run(child, paragraph_hidden):
                     continue
                 for node in _visible_children(child):
                     node_local = _local_name(node.tag)
@@ -448,18 +482,18 @@ class _DocxReader:
                 continue
             if local in {"pPr", "rPr", "delText", "txbxContent"}:
                 continue
-            parts.append(self._inline_text(child))
+            parts.append(self._inline_text(child, paragraph_hidden))
         return "".join(parts)
 
-    def _text_boxes(self, element: ET.Element):
+    def _text_boxes(self, element: ET.Element, paragraph_hidden: bool):
         for child in _visible_children(element):
             tag = _local_name(child.tag)
-            if tag in {"del", "moveFrom"} or (tag == "r" and self._hidden_run(child)):
+            if tag in {"del", "moveFrom"} or (tag == "r" and self._hidden_run(child, paragraph_hidden)):
                 continue
             if child.tag == self._tag("txbxContent"):
                 yield child
             else:
-                yield from self._text_boxes(child)
+                yield from self._text_boxes(child, paragraph_hidden)
 
     def _flatten(self, text: str) -> str:
         return "\n".join(part.strip() for part in text.split("\n") if part.strip())
@@ -480,7 +514,8 @@ class _DocxReader:
 
     def add_paragraph(self, paragraph: ET.Element) -> None:
         self._paragraph_index += 1
-        text = self._flatten(self._inline_text(paragraph))
+        paragraph_hidden = self._style_hidden(self._paragraph_style(paragraph), "paragraph")
+        text = self._flatten(self._inline_text(paragraph, paragraph_hidden))
         if not text:
             return
         style = self._paragraph_style(paragraph)
@@ -522,10 +557,11 @@ class _DocxReader:
         for child in _visible_children(container):
             local = _local_name(child.tag)
             if local == "p":
-                text = self._flatten(self._inline_text(child))
+                paragraph_hidden = self._style_hidden(self._paragraph_style(child), "paragraph")
+                text = self._flatten(self._inline_text(child, paragraph_hidden))
                 if text:
                     parts.append((text, self._quoted_paragraph(child, text)))
-                for box in self._text_boxes(child):
+                for box in self._text_boxes(child, self._style_hidden(self._paragraph_style(child), "paragraph")):
                     parts.extend(self._cell_parts(box))
             elif local == "tbl":
                 self.add_table(child)
@@ -584,7 +620,7 @@ class _DocxReader:
             local = _local_name(child.tag)
             if local == "p":
                 self.add_paragraph(child)
-                for box in self._text_boxes(child):
+                for box in self._text_boxes(child, self._style_hidden(self._paragraph_style(child), "paragraph")):
                     self.walk(box)
             elif local == "tbl":
                 self.add_table(child)
@@ -600,6 +636,7 @@ def parse_docx(path: Path) -> list[Segment]:
         if "word/document.xml" not in names:
             raise ValueError("missing word/document.xml")
         payload = archive.read("word/document.xml")
+        styles = ET.fromstring(archive.read("word/styles.xml")) if "word/styles.xml" in names else None
 
     if not payload.strip():
         raise ValueError("empty word/document.xml")
@@ -628,7 +665,7 @@ def parse_docx(path: Path) -> list[Segment]:
             f"does not match the main document namespace <{namespace}>"
         )
 
-    reader = _DocxReader(namespace)
+    reader = _DocxReader(namespace, styles)
     reader.walk(body)
     return reader.segments
 
