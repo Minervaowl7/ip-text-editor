@@ -11,6 +11,9 @@ from tests.test_skill import build_docx
 SCANNER = Path(__file__).resolve().parents[1] / "scripts" / "check_ip_jargon.py"
 TRANSITIONAL_NAMESPACE = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 STRICT_NAMESPACE = "http://purl.oclc.org/ooxml/wordprocessingml/main"
+VML_NAMESPACE = "urn:schemas-microsoft-com:vml"
+MC_NAMESPACE = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+WPS_NAMESPACE = "http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
 
 
 def findings(stdout: str) -> list[str]:
@@ -57,6 +60,15 @@ def content_control(element: str, identifier: int) -> str:
         f'<w:sdt><w:sdtPr><w:id w:val="{identifier}"/></w:sdtPr>'
         f"<w:sdtContent>{element}</w:sdtContent></w:sdt>"
     )
+
+
+def textbox_content(text: str) -> str:
+    return (f'<w:pict xmlns:v="{VML_NAMESPACE}"><v:shape><v:textbox><w:txbxContent>'
+            + paragraph(text) + '</w:txbxContent></v:textbox></v:shape></w:pict>')
+
+
+def spanned_cell(content: str, span: int) -> str:
+    return f'<w:tc><w:tcPr><w:gridSpan w:val="{span}"/></w:tcPr>{content}</w:tc>'
 
 
 def build_docx_root(directory: Path, root_xml: str, filename: str = "sample.docx") -> Path:
@@ -566,6 +578,89 @@ class JargonScannerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("ERROR", result.stderr)
         self.assertNotIn("CJK=", result.stdout)
+
+    def test_docx_text_box_paragraphs_are_scanned_and_hidden_ones_skipped(self):
+        visible = "<w:r>" + textbox_content("权利底座") + "</w:r>"
+        hidden = "<w:r><w:rPr><w:vanish/></w:rPr>" + textbox_content("质量体检") + "</w:r>"
+        deleted = "<w:del><w:r>" + textbox_content("评分画像") + "</w:r></w:del>"
+        doc = build_docx_body(self.temporary_directory(), f"<w:p>{visible}{hidden}{deleted}</w:p>")
+        result = self.scan("--strict", doc)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("权利底座", "\n".join(findings(result.stdout)))
+        self.assertNotIn("质量体检", result.stdout)
+        self.assertNotIn("评分画像", result.stdout)
+
+    def test_docx_alternate_content_text_box_counts_once(self):
+        box = "<w:txbxContent>" + paragraph("质量体检") + "</w:txbxContent>"
+        choice = f'<mc:Choice Requires="wps"><w:drawing><wps:txbx>{box}</wps:txbx></w:drawing></mc:Choice>'
+        fallback = "<mc:Fallback>" + textbox_content("质量体检") + "</mc:Fallback>"
+        body = (f'<w:p><w:r><mc:AlternateContent xmlns:mc="{MC_NAMESPACE}" xmlns:wps="{WPS_NAMESPACE}">'
+                f'{choice}{fallback}</mc:AlternateContent></w:r></w:p>')
+        result = self.scan("--strict", build_docx_body(self.temporary_directory(), body))
+        self.assertEqual(len(findings(result.stdout)), 1, result.stdout)
+        self.assertIn("质量体检", findings(result.stdout)[0])
+
+    def test_docx_grid_span_keeps_later_columns_with_their_headers(self):
+        body = grid_table(
+            3,
+            row_of(
+                cell(paragraph("项目")),
+                cell(paragraph("说明")),
+                cell(paragraph("原字段值")),
+            ),
+            row_of(spanned_cell(paragraph("标签与范围"), 2), cell(paragraph("权利底座"))),
+        )
+        path = build_docx_body(self.temporary_directory(), body)
+        result = self.scan("--strict", path)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(findings(result.stdout), [])
+        kept = protected(result.stdout)
+        self.assertTrue(
+            any("T#1 R#2: 权利底座" in line and "（第3列）" in line for line in kept), kept
+        )
+
+    def test_docx_merged_header_protects_each_original_field_column(self):
+        body = grid_table(3,
+            row_of(spanned_cell(paragraph("原字段值"), 2), cell(paragraph("编辑建议"))),
+            row_of(cell(paragraph("编号")), cell(paragraph("权利底座")), cell(paragraph("质量体检"))),
+        )
+        result = self.scan("--strict", build_docx_body(self.temporary_directory(), body))
+        self.assertIn("权利底座", "\n".join(protected(result.stdout)))
+        self.assertNotIn("权利底座", "\n".join(findings(result.stdout)))
+        self.assertIn("质量体检", "\n".join(findings(result.stdout)))
+
+    def test_docx_mixed_quote_cell_protects_only_the_quoted_paragraph(self):
+        quote = paragraph("权利底座", '<w:pPr><w:pStyle w:val="Quote"/></w:pPr>')
+        for comment, expected in [("此处为说明。", 0), ("此处使用质量体检的说法。", 1)]:
+            with self.subTest(comment=comment):
+                body = grid_table(1, row_of(cell(paragraph("说明"))), row_of(cell(quote + paragraph(comment))))
+                result = self.scan("--strict", build_docx_body(self.temporary_directory(), body))
+                self.assertEqual(result.returncode, expected, result.stdout)
+                self.assertIn("权利底座", "\n".join(protected(result.stdout)))
+                self.assertNotIn("权利底座", "\n".join(findings(result.stdout)))
+                if expected:
+                    self.assertIn("质量体检", "\n".join(findings(result.stdout)))
+
+    def test_markdown_indented_code_block_is_not_prose(self):
+        content = (
+            "字段示例：\n"
+            "\n"
+            "    权利底座\n"
+            "\n"
+            "- 清单第一项\n"
+            "\n"
+            "    列表续行提到权利底座。\n"
+            "\n"
+            "普通段落说明，\n"
+            "    续行提到质量体检。\n"
+        )
+        result = self.scan_text(content, name="indented_code.md")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        output = "\n".join(findings(result.stdout))
+        self.assertIn("L3: 权利底座", "\n".join(findings(self.scan_text(content, name="sample.txt").stdout)))
+        self.assertNotIn("L3:", output)
+        self.assertIn("L7: 权利底座", output)
+        self.assertIn("L10: 质量体检", output)
 
 
 if __name__ == "__main__":

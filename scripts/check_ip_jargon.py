@@ -146,6 +146,8 @@ class Segment:
     role: str = "正文"
     # Per-cell role for table rows, e.g. 引文 for a Word cell that only holds Quote paragraphs.
     cell_roles: tuple[str, ...] = ()
+    mixed_quotes: dict[int, str] = field(default_factory=dict)
+    header_grid: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -222,6 +224,9 @@ def parse_markdown_or_text(path: Path) -> list[Segment]:
     table_id = ""
     in_table = False
     in_blockquote = False
+    markdown = path.suffix.lower() != ".txt"
+    paragraph_open = False
+    list_indent = 0
     idx = 0
 
     while idx < len(raw_lines):
@@ -235,6 +240,16 @@ def parse_markdown_or_text(path: Path) -> list[Segment]:
             in_table = False
             idx += 1
             continue
+
+        expanded = raw.expandtabs(4)
+        indent = len(expanded) - len(expanded.lstrip(" "))
+        if stripped and indent < list_indent:
+            list_indent = 0
+        if markdown and not paragraph_open and stripped and indent >= list_indent + 4:
+            in_table = False
+            idx += 1
+            continue
+        paragraph_open = False
 
         opener = _fence_opener(raw)
         if opener is not None:
@@ -294,8 +309,12 @@ def parse_markdown_or_text(path: Path) -> list[Segment]:
             )
         else:
             in_blockquote = False
+            marker = MD_LIST_PREFIX_RE.match(expanded)
+            if marker:
+                list_indent = marker.end()
             cleaned = MD_LIST_PREFIX_RE.sub("", stripped)
             segments.append(Segment(f"L{line_no}", "prose", cleaned))
+        paragraph_open = segments[-1].kind != "heading"
         idx += 1
 
     return segments
@@ -376,10 +395,25 @@ class _DocxReader:
                     elif node_local == "noBreakHyphen":
                         parts.append("-")
                 continue
-            if local in {"pPr", "rPr", "delText"}:
+            if local in {"pPr", "rPr", "delText", "txbxContent"}:
                 continue
             parts.append(self._inline_text(child))
         return "".join(parts)
+
+    def _text_boxes(self, element: ET.Element):
+        for child in element:
+            tag = _local_name(child.tag)
+            if tag in {"del", "moveFrom"} or (tag == "r" and self._hidden_run(child)):
+                continue
+            if child.tag == self._tag("txbxContent"):
+                yield child
+            elif tag == "AlternateContent":
+                choice = child.find("{*}Choice")
+                branch = choice if choice is not None else child.find("{*}Fallback")
+                if branch is not None:
+                    yield from self._text_boxes(branch)
+            else:
+                yield from self._text_boxes(child)
 
     def _flatten(self, text: str) -> str:
         return "\n".join(part.strip() for part in text.split("\n") if part.strip())
@@ -432,40 +466,28 @@ class _DocxReader:
             return False
         return self._child(properties, "tblHeader") is not None
 
-    def _grid_offset(self, row: ET.Element, name: str) -> int:
-        """Number of leading or trailing grid columns this row skips."""
-
-        properties = self._child(row, "trPr")
-        if properties is None:
-            return 0
-        node = self._child(properties, name)
-        if node is None:
-            return 0
+    def _grid_value(self, element: ET.Element, property_name: str, name: str, default: int) -> int:
+        node = element.find(f"{self._tag(property_name)}/{self._tag(name)}")
         try:
-            return max(0, int((node.get(self._tag("val")) or "").strip()))
+            return max(default, int(node.get(self._tag("val"), ""))) if node is not None else default
         except ValueError:
-            return 0
+            return default
 
-    def _cell_text(self, container: ET.Element) -> tuple[str, list[bool]]:
-        parts: list[str] = []
-        quotes: list[bool] = []
+    def _cell_parts(self, container: ET.Element) -> list[tuple[str, bool]]:
+        parts = []
         for child in container:
             local = _local_name(child.tag)
             if local == "p":
                 text = self._flatten(self._inline_text(child))
                 if text:
-                    parts.append(text)
-                    quotes.append(self._quoted_paragraph(child, text))
+                    parts.append((text, self._quoted_paragraph(child, text)))
+                for box in self._text_boxes(child):
+                    parts.extend(self._cell_parts(box))
             elif local == "tbl":
                 self.add_table(child)
-            elif local in {"tcPr", "trPr", "tblPr", "tblGrid"}:
-                continue
-            else:
-                nested, nested_quotes = self._cell_text(child)
-                if nested:
-                    parts.append(nested)
-                    quotes.extend(nested_quotes)
-        return " ".join(parts), quotes
+            elif local not in {"del", "moveFrom", "tcPr", "trPr", "tblPr", "tblGrid"}:
+                parts.extend(self._cell_parts(child))
+        return parts
 
     def add_table(self, table: ET.Element) -> None:
         self._table_index += 1
@@ -475,27 +497,41 @@ class _DocxReader:
             row_index += 1
             if self._deleted_row(row):
                 continue
-            before = self._grid_offset(row, "gridBefore")
-            after = self._grid_offset(row, "gridAfter")
-            texts: list[str] = []
-            roles: list[str] = []
+            before = self._grid_value(row, "trPr", "gridBefore", 0)
+            after = self._grid_value(row, "trPr", "gridAfter", 0)
+            texts = [""] * before
+            roles = [""] * before
+            mixed_quotes = {}
+            header_grid = [""] * before
+            is_header = self._header_row(row, row_index)
             for cell in self._descend(row, {"tc"}):
-                text, quotes = self._cell_text(cell)
-                texts.append(text)
-                roles.append("引文" if quotes and all(quotes) else "")
-            cells = ("",) * before + tuple(texts) + ("",) * after
-            cell_roles = ("",) * before + tuple(roles) + ("",) * after
+                parts = self._cell_parts(cell)
+                prose = " ".join(text for text, quoted in parts if not quoted)
+                quote = " ".join(text for text, quoted in parts if quoted)
+                if quote and prose:
+                    mixed_quotes[len(texts)] = quote
+                texts.append(prose or quote)
+                roles.append("引文" if quote and not prose else "")
+                padding = [""] * (self._grid_value(cell, "tcPr", "gridSpan", 1) - 1)
+                if is_header:
+                    header_grid.extend([prose] * (1 + len(padding)))
+                texts.extend(padding)
+                roles.extend(padding)
+            cells = tuple(texts + [""] * after)
+            cell_roles = tuple(roles + [""] * after)
             if not any(cells):
                 continue
-            kind = "table_header" if self._header_row(row, row_index) else "table_row"
+            kind = "table_header" if is_header else "table_row"
             self.segments.append(
                 Segment(
                     f"{table_id} R#{row_index}",
                     kind,
-                    " | ".join(cells),
+                    " | ".join((*cells, *mixed_quotes.values())),
                     cells,
                     table_id,
                     cell_roles=cell_roles,
+                    mixed_quotes=mixed_quotes,
+                    header_grid=tuple(header_grid) if is_header else (),
                 )
             )
 
@@ -504,6 +540,8 @@ class _DocxReader:
             local = _local_name(child.tag)
             if local == "p":
                 self.add_paragraph(child)
+                for box in self._text_boxes(child):
+                    self.walk(box)
             elif local == "tbl":
                 self.add_table(child)
             elif local in {"del", "moveFrom"}:
@@ -686,7 +724,7 @@ def _protected_columns(segments: list[Segment]) -> dict[str, set[int]]:
     for seg in segments:
         if seg.kind != "table_header" or not seg.table:
             continue
-        for index, cell in enumerate(seg.cells):
+        for index, cell in enumerate(seg.header_grid or seg.cells):
             if ORIGINAL_FIELD_RE.search(cell):
                 protected[seg.table].add(index)
     return protected
@@ -707,7 +745,7 @@ def _table_legends(segments: list[Segment]) -> dict[str, dict[int, list[LegendEn
     result = {}
     for table, rows in tables.items():
         headers = {i: cell for row in rows if row.kind == "table_header"
-                   for i, cell in enumerate(row.cells) if cell.strip()}
+                   for i, cell in enumerate(row.header_grid or row.cells) if cell.strip()}
         meaning_columns = [i for i, header in headers.items() if re.search(r"含义|定义|释义|图例", header)]
         entries: dict[int, list[LegendEntry]] = defaultdict(list)
         for row in rows:
@@ -864,7 +902,7 @@ def analyze_file(path: Path) -> FileReport:
     for seg in segments:
         if seg.kind != "table_header" or not seg.table:
             continue
-        for index, cell in enumerate(seg.cells):
+        for index, cell in enumerate(seg.header_grid or seg.cells):
             if cell.strip():
                 prior = table_headers[seg.table].get(index, "")
                 table_headers[seg.table][index] = f"{prior} {cell.strip()}".strip()
@@ -881,9 +919,7 @@ def analyze_file(path: Path) -> FileReport:
                     continue
                 entries = prose_entries + table_legends[seg.table].get(index, [])
                 cell_role = seg.cell_roles[index] if index < len(seg.cell_roles) else ""
-                is_protected = seg.kind == "table_row" and (
-                    index in blocked or cell_role == "引文"
-                )
+                is_protected = cell_role == "引文" or (seg.kind == "table_row" and index in blocked)
                 if seg.kind == "table_header":
                     role = "表头"
                 elif cell_role:
@@ -906,8 +942,12 @@ def analyze_file(path: Path) -> FileReport:
                     findings=findings,
                     disclose=disclose,
                 )
+                if index in seg.mixed_quotes:
+                    quote_segment = Segment(seg.location, seg.kind, seg.mixed_quotes[index])
+                    _scan_segment(quote_segment, editable=False, role="引文", entries=entries,
+                                  syntax=False, column=column, findings=findings, disclose=disclose)
                 if seg.kind == "table_header":
-                    if HEADER_PACKED_RE.search(cell):
+                    if not is_protected and HEADER_PACKED_RE.search(cell):
                         findings.append(
                             Finding(
                                 "表头或格内压缩失义",
