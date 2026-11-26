@@ -6,6 +6,7 @@
 
 - **三档改稿尺度**：区分 `A档·高保真审校`（权利要求、合同、诉讼、FTO 比对结论）、`B档·报告定向去味`（FTO 综述、专利导航、查新与咨询报告）和 `C档·流畅沟通改写`（科普、培训、商务往来），找不到具体阅读障碍或残留问题的句段照录原文。
 - **专域核对与双语纠偏**：按需加载 FTO、专利导航、科技查新、Word 修订与 7 份主题用语表（含涉外中英常见误译、IPC 五级层级、2026 修订商标法版本提示及高频红线速查）。
+- **只读措辞扫描**。定位中文文稿中的生造隐喻、直译、含混表头和重复段落，供编辑按语境复核。
 - **只读 DOCX 来源与净稿检查**：内置零依赖 Python 标准库脚本 [scripts/check_docx_metadata.py](scripts/check_docx_metadata.py)，排查 `.docx` 属性、XML 注释、删除修订/被删域指令、相对外链及 PNG/JPEG/XMP 图像元数据中的工具署名与本机路径；支持 `--clean-draft` 核验对外净稿中的未接受修订、残留批注和黄色审阅高亮，以及多文件/目录批量扫描和 `--json` 输出。
 
 ## 安装与使用
@@ -24,6 +25,7 @@ git clone https://github.com/Minervaowl7/ip-text-editor.git
 - [agents/openai.yaml](agents/openai.yaml)：Codex 宿主界面展示名称与默认提示词配置。
 - [references/](references/genres.md)：按需加载的参考资料，包含体裁指导、FTO 与专利导航专项核对、改稿正反范例、Word 修订与去痕流程，以及专业用语表。
 - [scripts/check_docx_metadata.py](scripts/check_docx_metadata.py)：只读 DOCX 交付件来源信息与对外净稿检查脚本。
+- [scripts/check_ip_jargon.py](scripts/check_ip_jargon.py) 扫描 Markdown、纯文本及 DOCX 的候选问题。
 - [tests/test_skill.py](tests/test_skill.py)：仓库结构、链接锚点、排版护栏、脱敏卫生与元数据检查脚本的自动化测试。
 
 ## 命令行校验与测试
@@ -39,6 +41,14 @@ python -X utf8 scripts/check_docx_metadata.py <交付文件或目录...> --conta
 ```bash
 python -X utf8 scripts/check_docx_metadata.py <对外净稿.docx> --clean-draft --json
 ```
+
+扫描专业用语与句式时传入 `.md`、`.txt` 或 `.docx` 文件。
+
+```bash
+python -X utf8 scripts/check_ip_jargon.py report.md report.docx
+```
+
+`--strict` 在发现候选问题时返回退出码 `1`。文件无效或无法读取时返回 `2`。结果用来定位人工复核项，命中数只统计脚本发现的候选问题。
 
 运行全部技能结构与脚本单元测试（仅依赖 Python 3.10+ 标准库）：
 
