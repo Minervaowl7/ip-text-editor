@@ -3,10 +3,59 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from xml.sax.saxutils import escape
+import zipfile
 
 from tests.test_skill import build_docx
 
 SCANNER = Path(__file__).resolve().parents[1] / "scripts" / "check_ip_jargon.py"
+TRANSITIONAL_NAMESPACE = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+STRICT_NAMESPACE = "http://purl.oclc.org/ooxml/wordprocessingml/main"
+
+
+def findings(stdout: str) -> list[str]:
+    return [line.strip()[2:] for line in stdout.splitlines() if line.startswith("  - ")]
+
+
+def protected(stdout: str) -> list[str]:
+    return [line.strip()[2:] for line in stdout.splitlines() if line.startswith("  · ")]
+
+
+def paragraph(text: str, properties: str = "") -> str:
+    return f"<w:p>{properties}<w:r><w:t>{escape(text)}</w:t></w:r></w:p>"
+
+
+def row(content: str, properties: str = "") -> str:
+    return f"<w:tr>{properties}<w:tc>{content}</w:tc></w:tr>"
+
+
+def table(*rows: str) -> str:
+    return "<w:tbl><w:tblPr/><w:tblGrid><w:gridCol/></w:tblGrid>" + "".join(rows) + "</w:tbl>"
+
+
+def build_docx_root(directory: Path, root_xml: str, filename: str = "sample.docx") -> Path:
+    path = directory / filename
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>',
+        )
+        archive.writestr("word/document.xml", root_xml)
+    return path
+
+
+def build_docx_body(
+    directory: Path,
+    body_xml: str,
+    *,
+    namespace: str = TRANSITIONAL_NAMESPACE,
+    filename: str = "sample.docx",
+) -> Path:
+    return build_docx_root(
+        directory,
+        f'<w:document xmlns:w="{namespace}"><w:body>{body_xml}</w:body></w:document>',
+        filename,
+    )
 
 
 class JargonScannerTests(unittest.TestCase):
@@ -18,8 +67,25 @@ class JargonScannerTests(unittest.TestCase):
             check=False,
         )
 
+    def temporary_directory(self) -> Path:
+        directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(directory.cleanup)
+        return Path(directory.name)
+
+    def write_document(self, content: str, name: str = "sample.md") -> Path:
+        path = self.temporary_directory() / name
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def scan_text(self, content: str, name: str = "sample.md"):
+        path = self.write_document(content, name)
+        original = path.read_bytes()
+        result = self.scan("--strict", path)
+        self.assertEqual(path.read_bytes(), original, "the scanner must not modify its input")
+        return result
+
     def test_markdown_distinguishes_metaphor_from_physical_part(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
             path = Path(temp) / "report.md"
             path.write_text(
                 "预对准底座与基台连接。\n评估有效底座和前向被引。\n\n"
@@ -42,7 +108,7 @@ class JargonScannerTests(unittest.TestCase):
             '<w:tbl><w:tr><w:tc><w:p><w:r><w:t>角色／取证</w:t>'
             '</w:r></w:p></w:tc></w:tr></w:tbl>'
         )
-        with tempfile.TemporaryDirectory() as temp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
             path = build_docx(Path(temp), body_xml=body)
             result = self.scan(path)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -51,6 +117,218 @@ class JargonScannerTests(unittest.TestCase):
             clean = build_docx(Path(temp), filename="clean.docx")
             self.assertEqual(self.scan("--strict", clean).returncode, 0)
             self.assertEqual(self.scan(path.with_name("missing.docx")).returncode, 2)
+
+    def test_markdown_fences_skip_nested_and_tilde_code_blocks(self):
+        content = (
+            "\ufeff````text\n普通字段示例\n```\n````\n评分画像需要改。\n\n"
+            "~~~text\n字段：质量体检\n~~~\n"
+        )
+        result = self.scan_text(content)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        output = "\n".join(findings(result.stdout))
+        self.assertIn("L5: 评分画像", output)
+        self.assertNotIn("质量体检", output)
+        self.assertNotIn("普通字段示例", output)
+
+    def test_markdown_table_variants_report_compressed_header(self):
+        cases = {
+            "optional_outer_pipes": "角色／取证 | 说明\n--- | ---\n外围 | 未定义\n",
+            "spaced_slash": "| 角色 / 取证 | 说明 |\n| --- | --- |\n| 外围 | 未定义 |\n",
+        }
+        for label, content in cases.items():
+            with self.subTest(case=label):
+                result = self.scan_text(content, name=f"{label}.md")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("L1: 压缩表头", result.stdout)
+
+    def test_quotation_and_original_field_values_are_not_rewrite_targets(self):
+        content = (
+            "> 对方文稿原文如下。权利底座。\n\n"
+            "按原字段 `前向被引` 检索。\n\n"
+            "| 项目 | 原字段值 |\n| --- | --- |\n| 标签 | 权利底座 |\n\n"
+            "改稿候选：评分画像。\n"
+        )
+        result = self.scan_text(content)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        action = "\n".join(findings(result.stdout))
+        kept = "\n".join(protected(result.stdout))
+        self.assertIn("L9: 评分画像", action)
+        self.assertNotIn("权利底座", action)
+        self.assertNotIn("前向被引", action)
+        for location in ("L1", "L3", "L7"):
+            self.assertIn(location, kept)
+        self.assertIn("引文", kept)
+        self.assertIn("原表值", kept)
+
+    def test_quotation_frequency_is_excluded_from_body_density(self):
+        result = self.scan_text("> 基于该案公开材料。\n" * 6 + "\n以上为引文。\n")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("全文密度", result.stdout)
+
+    def test_evidence_direction_and_technical_terms(self):
+        content = (
+            "侵权取证难度较高，关键参数位于封闭腔体。\n"
+            "侵权取证：高。\n"
+            "螺栓穿过底座后与螺母连接。\n"
+            "采用磷酸钙沉淀制备粉体。\n"
+            "拆去保护盖后易观察到连接端。\n"
+            "专利组合是公司业务的支撑底座。\n"
+        )
+        result = self.scan_text(content)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        output = "\n".join(findings(result.stdout))
+        self.assertIn("L2: 方向不明取证评级", output)
+        self.assertIn("L6: 底座", output)
+        for location in ("L1:", "L3:", "L4:", "L5:"):
+            self.assertNotIn(location, output)
+
+    def test_explicit_direction_and_legend_resolve_ratings(self):
+        legend = (
+            "| 评级 | 含义 |\n| --- | --- |\n| 高 | 较难 |\n| 中 | 中等 |\n| 低 | 较易 |\n\n"
+        )
+        content = legend + "表A：取证难度：高。\n\n表B：取证容易程度：高。\n\n统一写作取证：高。\n"
+        result = self.scan_text(content)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("方向不明取证评级", result.stdout)
+
+    def test_ipc_and_enumeration_cells_are_not_packed_columns(self):
+        content = (
+            "| 分组口径 | 样例 |\n| --- | --- |\n"
+            "| H01L21/67／H01L21/68 | 有效／审中／终止 |\n"
+            "| 外围／细化／低 | 待核 |\n"
+            "| H/M/N/D | S/A/B |\n"
+        )
+        result = self.scan_text(content)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        output = "\n".join(findings(result.stdout))
+        self.assertIn("L4: 拼栏格值", output)
+        for location in ("L3:", "L5:"):
+            self.assertNotIn(location, output)
+
+    def test_original_value_column_is_protected_while_unknown_table_is_marked(self):
+        original = "| 项目 | 原字段值 |\n| --- | --- |\n| 标签 | 权利底座 |\n"
+        unknown = "| 项目 | 说明 |\n| --- | --- |\n| 标签 | 权利底座 |\n"
+
+        result = self.scan_text(original, name="original.md")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(findings(result.stdout), [])
+        self.assertIn("原表值", "\n".join(protected(result.stdout)))
+
+        result = self.scan_text(unknown, name="unknown.md")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("来源需判定", "\n".join(findings(result.stdout)))
+
+    def test_mixed_table_protects_original_column_only(self):
+        content = (
+            "| 原字段值 | 编辑说明 |\n| --- | --- |\n"
+            "| 权利底座 | 权利底座应改为有效专利占比 |\n"
+        )
+        result = self.scan_text(content, name="mixed.md")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        rows = findings(result.stdout)
+        self.assertEqual(len(rows), 1, rows)
+        self.assertIn("权利底座应改为", rows[0])
+        self.assertIn("原表值", "\n".join(protected(result.stdout)))
+
+    def test_repetition_reports_identical_rows_separately(self):
+        first = "项目组应持续跟踪重点企业提出的申请并核对申请文本中的关键器件及其装配关系。"
+        second = "保留历次会议讨论形成的原始记录和试验数据供后续专家检查相同型号的设备。"
+        rows = "| 建议甲 | 建议乙 |\n| --- | --- |\n" + f"| {first} | {second} |\n" * 3
+        result = self.scan_text(rows, name="rows.md")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        output = "\n".join(findings(result.stdout))
+        self.assertIn("3x [L3, L4, L5]", output)
+        self.assertIn(first.rstrip("。"), output)
+        self.assertIn(second.rstrip("。"), output)
+        self.assertNotIn("2x [", output)
+
+    def test_repetition_reports_two_verbatim_paragraphs(self):
+        text = "项目组应持续跟踪重点企业提出的申请并核对申请文本中的关键器件及其装配关系。"
+        result = self.scan_text(f"{text}\n\n{text}\n", name="twice.md")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("2x [L1, L3]", result.stdout)
+        self.assertIn("两处逐字相同", result.stdout)
+
+    def test_repetition_keeps_distinct_facts_apart(self):
+        paragraphs = [
+            f"截至{year}年核对公开数据库登记的A-{model}型设备涉及的证据，专利申请为{amount}件"
+            f"并且其中的活塞组件相关专利有效数量为{valid}件，仍处于实质审查程序中的另作记录。"
+            for year, model, amount, valid in [(2023, 10, 3, 2), (2024, 20, 5, 4), (2025, 30, 9, 8)]
+        ]
+        result = self.scan_text("\n\n".join(paragraphs), name="facts.md")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(findings(result.stdout), [])
+        kept = "\n".join(protected(result.stdout))
+        self.assertIn("相近句式", kept)
+        for token in ("2023", "2024", "2025", "A-10", "A-20", "A-30", "不可并作删除重复"):
+            self.assertIn(token, kept)
+
+    def test_docx_strict_namespace_reports_visible_text(self):
+        path = build_docx_body(
+            self.temporary_directory(),
+            paragraph("权利底座需要说明。"),
+            namespace=STRICT_NAMESPACE,
+        )
+        result = self.scan("--strict", path)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("P#1: 权利底座", result.stdout)
+
+    def test_docx_invalid_root_is_not_reported_as_clean(self):
+        path = build_docx_root(
+            self.temporary_directory(),
+            f'<w:p xmlns:w="{TRANSITIONAL_NAMESPACE}"/>',
+        )
+        result = self.scan("--strict", path)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("ERROR", result.stderr)
+        self.assertNotIn("CJK=", result.stdout)
+
+    def test_docx_hidden_text_soft_breaks_and_deleted_rows(self):
+        hidden = '<w:p><w:r><w:rPr><w:vanish/></w:rPr><w:t>权利活度</w:t></w:r></w:p>'
+        broken = '<w:p><w:r><w:t>权利</w:t><w:br/><w:t>底座</w:t></w:r></w:p>'
+        quote = paragraph("报告原文写作质量体检。", '<w:pPr><w:pStyle w:val="Quote"/></w:pPr>')
+        deleted_row = row(paragraph("评分画像"), '<w:trPr><w:del w:id="3" w:author="审阅"/></w:trPr>')
+        body = hidden + broken + quote + table(
+            row(paragraph("项目")), deleted_row, row(paragraph("配套专利"))
+        )
+        path = build_docx_body(self.temporary_directory(), body)
+        result = self.scan("--strict", path)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("权利活度", result.stdout)
+        self.assertNotIn("权利底座", result.stdout)
+        self.assertNotIn("评分画像", result.stdout)
+        self.assertIn("质量体检", "\n".join(protected(result.stdout)))
+
+    def test_docx_multirow_headers_and_nested_cell_content(self):
+        header = "<w:trPr><w:tblHeader/></w:trPr>"
+        inner = table(row(paragraph("角色／取证")))
+        cell_control = (
+            "<w:sdt><w:sdtPr/><w:sdtContent>" + paragraph("前向被引") + "</w:sdtContent></w:sdt>"
+        )
+        body = table(
+            row(paragraph("工作分工"), header),
+            row(paragraph("角色／取证"), header),
+            row(paragraph("配套专利")),
+        ) + table(row(paragraph("说明") + inner + cell_control + paragraph("补充")))
+        path = build_docx_body(self.temporary_directory(), body)
+        result = self.scan("--strict", path)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        output = "\n".join(findings(result.stdout))
+        self.assertIn("T#1 R#2: 压缩表头", output)
+        self.assertIn("T#3 R#1: 压缩表头", output)
+        self.assertIn("T#2 R#1: 前向被引", output)
+
+    def test_unsupported_extension_is_reported_as_unchecked(self):
+        path = self.write_document("品牌,型号\n", name="table.csv")
+        result = self.scan("--strict", path)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("UNCHECKED", result.stderr)
+
+    def test_corrupt_docx_is_reported_as_error(self):
+        path = self.write_document("not a zip archive", name="broken.docx")
+        result = self.scan("--strict", path)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("ERROR", result.stderr)
 
 
 if __name__ == "__main__":

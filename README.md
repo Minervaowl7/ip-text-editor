@@ -6,7 +6,7 @@
 
 - **三档改稿尺度**：区分 `A档·高保真审校`（权利要求、合同、诉讼、FTO 比对结论）、`B档·报告定向去味`（FTO 综述、专利导航、查新与咨询报告）和 `C档·流畅沟通改写`（科普、培训、商务往来），找不到具体阅读障碍或残留问题的句段照录原文。
 - **专域核对与双语纠偏**：按需加载 FTO、专利导航、科技查新、Word 修订与 7 份主题用语表（含涉外中英常见误译、IPC 五级层级、2026 修订商标法版本提示及高频红线速查）。
-- **只读措辞扫描**。定位中文文稿中的生造隐喻、直译、含混表头和重复段落，供编辑按语境复核。
+- **只读措辞扫描**。定位中文文稿中的生造隐喻、直译、含混表头和重复段落，并按段落角色和表坐标（如`T#1 R#2`）给出处理建议：引文、原表字段值和行内字段名列入“出处保留”，不参加正文词频和拼栏判断；表值来源不明时标“需判定”，由编辑确认后再动。跨段复读按三处及以上提示，另单独提示两处逐字相同的长文；同一句架只有年份、型号、件数不同时，只列差异，不作为可删除的重复。
 - **只读 DOCX 来源与净稿检查**：内置零依赖 Python 标准库脚本 [scripts/check_docx_metadata.py](scripts/check_docx_metadata.py)，排查 `.docx` 属性、XML 注释、删除修订/被删域指令、相对外链及 PNG/JPEG/XMP 图像元数据中的工具署名与本机路径；支持 `--clean-draft` 核验对外净稿中的未接受修订、残留批注和黄色审阅高亮，以及多文件/目录批量扫描和 `--json` 输出。
 
 ## 安装与使用
@@ -25,8 +25,9 @@ git clone https://github.com/Minervaowl7/ip-text-editor.git
 - [agents/openai.yaml](agents/openai.yaml)：Codex 宿主界面展示名称与默认提示词配置。
 - [references/](references/genres.md)：按需加载的参考资料，包含体裁指导、FTO 与专利导航专项核对、改稿正反范例、Word 修订与去痕流程，以及专业用语表。
 - [scripts/check_docx_metadata.py](scripts/check_docx_metadata.py)：只读 DOCX 交付件来源信息与对外净稿检查脚本。
-- [scripts/check_ip_jargon.py](scripts/check_ip_jargon.py) 扫描 Markdown、纯文本及 DOCX 的候选问题。
+- [scripts/check_ip_jargon.py](scripts/check_ip_jargon.py) 扫描 Markdown、纯文本及 DOCX（含严格格式 OOXML）的候选问题，只读，不改动被扫描文件。
 - [tests/test_skill.py](tests/test_skill.py)：仓库结构、链接锚点、排版护栏、脱敏卫生与元数据检查脚本的自动化测试。
+- [tests/test_jargon.py](tests/test_jargon.py)：措辞扫描脚本的端到端用例，覆盖围栏与表格变体、引文与原表值保护、取证方向、复读阈值和 DOCX 失败状态。
 
 ## 命令行校验与测试
 
@@ -49,6 +50,8 @@ python -X utf8 scripts/check_ip_jargon.py report.md report.docx
 ```
 
 `--strict` 在发现候选问题时返回退出码 `1`。文件无效或无法读取时返回 `2`。结果用来定位人工复核项，命中数只统计脚本发现的候选问题。
+
+不支持的扩展名按“未检查”处理并返回 `2`，不会报告为干净。`出处保留与相近句式` 一栏只列位置、角色和出处，不计入候选问题，也不影响退出码。表格是否属于原表字段值取决于列名和委托材料：没有元数据时脚本标“需判定”，不替编辑改动原表。
 
 运行全部技能结构与脚本单元测试（仅依赖 Python 3.10+ 标准库）：
 
