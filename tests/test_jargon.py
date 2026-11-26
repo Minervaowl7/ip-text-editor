@@ -738,6 +738,17 @@ class JargonScannerTests(unittest.TestCase):
                 self.assertEqual(len(findings(scan.stdout)), 1)
                 self.assertIn(expected, findings(scan.stdout)[0])
 
+    def test_list_item_uses_the_role_of_its_contents(self):
+        for prefix in ("- ", "1. ", "- 1) "):
+            with self.subTest(prefix=prefix):
+                quote = prefix + "> 权利底座。\n"
+                self.assertEqual(self.scan_text(quote).returncode, 0)
+                result = self.scan_text(quote + "- 质量体检。")
+                self.assertIn("L1: 权利底座", "\n".join(protected(result.stdout)))
+                self.assertNotIn("权利底座", "\n".join(findings(result.stdout)))
+                self.assertIn("L2: 质量体检", "\n".join(findings(result.stdout)))
+
+
     def test_markdown_indented_code_block_is_not_prose(self):
         content = (
             "字段示例：\n"

@@ -270,13 +270,22 @@ def parse_markdown_or_text(path: Path) -> list[Segment]:
             continue
         paragraph_open = False
 
-        marker = MD_LIST_PREFIX_RE.match(expanded)
-        fence_indent = marker.end() if markdown and marker else list_indent
-        opener = _fence_opener(expanded[fence_indent:])
+        content = expanded[list_indent:]
+        starts_item = False
+        if markdown:
+            while (marker := MD_LIST_PREFIX_RE.match(content)) and not MD_THEMATIC_BREAK_RE.fullmatch(content.strip()):
+                starts_item = True
+                list_indent += marker.end()
+                list_indents.append(list_indent)
+                content = content[marker.end():]
+            stripped = content.strip()
+            if starts_item:
+                in_blockquote = False
+                in_table = False
+        fence_indent = list_indent
+        opener = _fence_opener(content)
         if opener is not None:
             fence = opener
-            if marker and markdown:
-                list_indents.append(fence_indent)
             in_table = False
             in_blockquote = False
             idx += 1
@@ -322,14 +331,14 @@ def parse_markdown_or_text(path: Path) -> list[Segment]:
                     role="引文",
                 )
             )
-        elif MD_ITALIC_NOTE_RE.match(stripped):
-            in_blockquote = False
-            segments.append(Segment(f"L{line_no}", "note", stripped.strip("* ").strip(), role="注释"))
         elif markdown and indent <= list_indent + 3 and MD_THEMATIC_BREAK_RE.fullmatch(stripped):
             # A thematic break closes the quotation; the text after it is prose again.
             in_blockquote = False
             idx += 1
             continue
+        elif MD_ITALIC_NOTE_RE.match(stripped):
+            in_blockquote = False
+            segments.append(Segment(f"L{line_no}", "note", stripped.strip("* ").strip(), role="注释"))
         elif in_blockquote and not MD_LIST_PREFIX_RE.match(stripped):
             # Markdown lazy continuation: the line still belongs to the open quotation.
             segments.append(
@@ -337,11 +346,9 @@ def parse_markdown_or_text(path: Path) -> list[Segment]:
             )
         else:
             in_blockquote = False
-            if marker:
-                list_indents.append(marker.end())
-            cleaned = MD_LIST_PREFIX_RE.sub("", stripped)
+            cleaned = stripped if markdown else MD_LIST_PREFIX_RE.sub("", stripped)
             start = line_no if markdown else 0
-            if markdown and not marker and segments and idx and segments[-1].paragraph_start:
+            if markdown and not starts_item and segments and idx and segments[-1].paragraph_start:
                 previous = raw_lines[idx - 1]
                 if (previous.strip() and segments[-1].location == f"L{idx}"
                         and not previous.endswith(("  ", "\\"))):
