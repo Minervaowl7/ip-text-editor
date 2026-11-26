@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import re
 import sys
@@ -19,7 +19,7 @@ from zipfile import BadZipFile, ZipFile
 
 CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 URL_RE = re.compile(r"https?://\S+")
-INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+INLINE_CODE_RE = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)")
 
 WORD_NAMESPACES = frozenset(
     {
@@ -83,11 +83,13 @@ SLASH_EXCLUDE_RE = re.compile(
     r"\b\d+(?:[／/]\d+)+\b"
 )
 EVIDENCE_RATING_RE = re.compile(
-    r"(?:侵权)?(?:可)?取证(?:性|难度|容易程度|易得性|难易程度)?\s*[：:]?\s*(较高|较低|中等|高|中|低)"
+    r"(?:侵权)?(?:可)?取证(?:性|难度|容易程度|易得性|难易程度)?"
+    r"(?:\s*[：:]\s*|\s+|(?:为|是)|(?=较高|较低|中等|高|低))"
+    r"(较高|较低|中等|高|中|低)(?![\w])"
 )
 EVIDENCE_DIRECTION_RE = re.compile(r"难度|容易程度|容易|易得")
-EVIDENCE_METRIC_RE = re.compile(r"取证|侵权")
-OTHER_METRIC_RE = re.compile(r"研发|开发|实施|运营|维护|诉讼|许可|布局|规避|检索")
+EVIDENCE_METRIC_RE = re.compile(r"取证")
+OTHER_METRIC_RE = re.compile(r"侵权风险|研发|开发|实施|运营|维护|诉讼|许可|布局|规避|检索")
 RATING_VALUE_SET = frozenset(("较高", "较低", "中等", "高", "中", "低"))
 LEGEND_INLINE_RE = re.compile(r"(高|中|低)\s*[＝=:：]\s*(较难|较易|中等|难|易)")
 LEGEND_MEANING_RE = re.compile(r"较难|较易|中等|难|易")
@@ -148,6 +150,7 @@ class Segment:
     cell_roles: tuple[str, ...] = ()
     mixed_quotes: dict[int, str] = field(default_factory=dict)
     header_grid: tuple[str, ...] = ()
+    paragraph_start: int = 0
 
 
 @dataclass(frozen=True)
@@ -313,7 +316,13 @@ def parse_markdown_or_text(path: Path) -> list[Segment]:
             if marker:
                 list_indent = marker.end()
             cleaned = MD_LIST_PREFIX_RE.sub("", stripped)
-            segments.append(Segment(f"L{line_no}", "prose", cleaned))
+            start = line_no if markdown else 0
+            if markdown and not marker and segments and idx and segments[-1].paragraph_start:
+                previous = raw_lines[idx - 1]
+                if (previous.strip() and segments[-1].location == f"L{idx}"
+                        and not previous.endswith(("  ", "\\"))):
+                    start = segments[-1].paragraph_start
+            segments.append(Segment(f"L{line_no}", "prose", cleaned, paragraph_start=start))
         paragraph_open = segments[-1].kind != "heading"
         idx += 1
 
@@ -459,12 +468,10 @@ class _DocxReader:
         return self._child(properties, "del") is not None
 
     def _header_row(self, row: ET.Element, index: int) -> bool:
-        if index == 1:
-            return True
-        properties = self._child(row, "trPr")
-        if properties is None:
-            return False
-        return self._child(properties, "tblHeader") is not None
+        flag = row.find(f"{self._tag('trPr')}/{self._tag('tblHeader')}")
+        if flag is None:
+            return index == 1
+        return flag.get(self._tag("val"), "1").lower() not in {"0", "false", "off"}
 
     def _grid_value(self, element: ET.Element, property_name: str, name: str, default: int) -> int:
         node = element.find(f"{self._tag(property_name)}/{self._tag(name)}")
@@ -686,7 +693,7 @@ def _syntax_snippets(text: str) -> list[str]:
 
 
 def _category_hits(
-    text: str, entries: list[LegendEntry], *, syntax: bool
+    text: str, entries: list[LegendEntry]
 ) -> list[tuple[str, str]]:
     hits: list[tuple[str, str]] = []
     for snippet in _metaphor_snippets(text):
@@ -697,9 +704,6 @@ def _category_hits(
         hits.append(("空泛管理堆砌", f"{match.group(0)} ({_clip(text, 55)})"))
     for snippet in _evidence_snippets(text, entries):
         hits.append(("表头或格内压缩失义", snippet))
-    if syntax:
-        for snippet in _syntax_snippets(text):
-            hits.append(("句式与高频套词", snippet))
     return hits
 
 
@@ -707,7 +711,7 @@ def _split_inline_code(text: str) -> tuple[str, list[str]]:
     literals: list[str] = []
 
     def replace(match: re.Match[str]) -> str:
-        value = match.group(1).strip()
+        value = match.group(2).strip()
         if value:
             literals.append(value)
         return " " * len(match.group(0))
@@ -786,14 +790,13 @@ def _scan_segment(
     editable: bool,
     role: str,
     entries: list[LegendEntry],
-    syntax: bool,
     column: int = 0,
     findings: list[Finding],
     disclose,
 ) -> None:
     suffix = f"（第{column}列）" if column else ""
     masked, literals = _split_inline_code(seg.text)
-    for category, snippet in _category_hits(masked, entries, syntax=syntax):
+    for category, snippet in _category_hits(masked, entries):
         if editable:
             findings.append(
                 Finding(category, seg.location, f"{snippet}{suffix}", role, CATEGORY_ACTIONS[category])
@@ -802,13 +805,26 @@ def _scan_segment(
             disclose(seg.location, f"{snippet}{suffix}", role)
 
     for literal in literals:
-        for category, snippet in _category_hits(literal, entries, syntax=False):
+        for category, snippet in _category_hits(literal, entries):
             disclose(seg.location, f"{snippet}{suffix}", "原字段值（行内代码）")
 
 
 def _location_key(location: str):
     parts = re.split(r"(\d+)", location)
     return tuple((0, int(part)) if part.isdigit() else (1, part) for part in parts if part)
+
+
+def _paragraph_units(segments: list[Segment]) -> list[Segment]:
+    units: list[Segment] = []
+    for seg in segments:
+        if seg.paragraph_start and units and seg.paragraph_start == units[-1].paragraph_start:
+            prior = units[-1]
+            space = " " if prior.text[-1:].isascii() and seg.text[:1].isascii() else ""
+            units[-1] = replace(prior, text=prior.text + space + seg.text,
+                                location=f"L{seg.paragraph_start}-{seg.location}")
+        else:
+            units.append(seg)
+    return units
 
 
 def _check_repetitions(
@@ -937,7 +953,6 @@ def analyze_file(path: Path) -> FileReport:
                     editable=not is_protected,
                     role=role,
                     entries=entries,
-                    syntax=False,
                     column=column,
                     findings=findings,
                     disclose=disclose,
@@ -945,9 +960,10 @@ def analyze_file(path: Path) -> FileReport:
                 if index in seg.mixed_quotes:
                     quote_segment = Segment(seg.location, seg.kind, seg.mixed_quotes[index])
                     _scan_segment(quote_segment, editable=False, role="引文", entries=entries,
-                                  syntax=False, column=column, findings=findings, disclose=disclose)
+                                  column=column, findings=findings, disclose=disclose)
                 if seg.kind == "table_header":
-                    if not is_protected and HEADER_PACKED_RE.search(cell):
+                    header_text, _ = _split_inline_code(cell)
+                    if not is_protected and HEADER_PACKED_RE.search(header_text):
                         findings.append(
                             Finding(
                                 "表头或格内压缩失义",
@@ -1014,12 +1030,18 @@ def analyze_file(path: Path) -> FileReport:
             editable=seg.editable,
             role=_protection_reason(seg),
             entries=prose_entries,
-            syntax=seg.kind == "prose",
             findings=findings,
             disclose=disclose,
         )
 
-    _check_repetitions(segments, protected, findings, disclose)
+    paragraphs = _paragraph_units(segments)
+    for seg in paragraphs:
+        if seg.kind == "prose" and seg.editable:
+            clean, _ = _split_inline_code(seg.text)
+            for snippet in _syntax_snippets(clean):
+                category = "句式与高频套词"
+                findings.append(Finding(category, seg.location, snippet, seg.role, CATEGORY_ACTIONS[category]))
+    _check_repetitions(paragraphs, protected, findings, disclose)
 
     total_cjk = len(CJK_RE.findall("\n".join(seg.text for seg in segments)))
     body_segments = [

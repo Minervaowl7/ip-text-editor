@@ -641,6 +641,36 @@ class JargonScannerTests(unittest.TestCase):
                 if expected:
                     self.assertIn("质量体检", "\n".join(findings(result.stdout)))
 
+    def test_protected_markdown_header_and_multibacktick_field_value(self):
+        for text in ("| `角色／取证` | 说明 |\n| --- | --- |\n| A | B |",
+                     "原字段 ``前缀`权利底座`后缀``。"):
+            with self.subTest(text=text):
+                result = self.scan_text(text)
+                self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.scan_text("``未配对，权利底座。").returncode, 1)
+
+    def test_evidence_ratings_require_a_metric_and_a_rating_value(self):
+        for text in ("在侵权取证中，应先核对产品型号和销售时间。", "取证高度依赖现场检查结果。",
+                     "| 产品 | 侵权风险 |\n| --- | --- |\n| 方案甲 | 高 |"):
+            with self.subTest(text=text):
+                self.assertEqual(self.scan_text(text).returncode, 0, text)
+        self.assertEqual(self.scan_text("侵权取证：中。").returncode, 1)
+
+    def test_disabled_table_header_is_a_regular_data_row(self):
+        data = row(paragraph("外围／细化／低"), '<w:trPr><w:tblHeader w:val="0"/></w:trPr>')
+        body = table(row(paragraph("自编分析")), data)
+        result = self.scan("--strict", build_docx_body(self.temporary_directory(), body))
+        self.assertIn("拼栏格值", "\n".join(findings(result.stdout)))
+
+    def test_soft_wraps_keep_sentence_and_repetition_checks(self):
+        text = "项目组应持续跟踪重点企业提出的申请并核对申请文本中的关键器件及其装配关系。"
+        wrapped = text.replace("申请并", "申请\n并")
+        result = self.scan_text("\n\n".join((text, wrapped, wrapped)))
+        self.assertIn("3x [L1, L3-L4, L6-L7]", result.stdout)
+        long_sentence = "对申请文本中的关键器件及其装配关系进行核对" * 5
+        result = self.scan_text(long_sentence[:58] + "\n" + long_sentence[58:] + "。")
+        self.assertIn("长句", "\n".join(findings(result.stdout)))
+
     def test_markdown_indented_code_block_is_not_prose(self):
         content = (
             "字段示例：\n"
