@@ -718,6 +718,26 @@ class JargonScannerTests(unittest.TestCase):
         result = self.scan_text(long_sentence[:58] + "\n" + long_sentence[58:] + "。")
         self.assertIn("长句", "\n".join(findings(result.stdout)))
 
+    def test_soft_wrap_does_not_hide_lexical_findings(self):
+        result = self.scan_text("前向\n被引。\n原词 `权利\n底座`。")
+        rows = findings(result.stdout)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(len(rows), 1, result.stdout)
+        self.assertIn("L1-L2: 前向被引", rows[0])
+
+    def test_inline_compatibility_choice_and_fallback_are_alternatives(self):
+        def run(text):
+            return f"<w:r><w:t>{text}</w:t></w:r>"
+        for choice, expected in [(run("权利底座"), "权利底座"), ("", "质量体检")]:
+            branch = f'<mc:Choice Requires="wps">{choice}</mc:Choice>' if choice else ""
+            xml = (f'<w:p><mc:AlternateContent xmlns:mc="{MC_NAMESPACE}" xmlns:wps="{WPS_NAMESPACE}">'
+                   f'{branch}<mc:Fallback>{run("质量体检")}</mc:Fallback></mc:AlternateContent></w:p>')
+            with self.subTest(expected=expected):
+                scan = self.scan("--strict", build_docx_body(self.temporary_directory(), xml))
+                self.assertIn("CJK=4", scan.stdout)
+                self.assertEqual(len(findings(scan.stdout)), 1)
+                self.assertIn(expected, findings(scan.stdout)[0])
+
     def test_markdown_indented_code_block_is_not_prose(self):
         content = (
             "字段示例：\n"

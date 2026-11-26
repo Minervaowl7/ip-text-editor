@@ -156,6 +156,14 @@ class Segment:
     mixed_quotes: dict[int, str] = field(default_factory=dict)
     header_grid: tuple[str, ...] = ()
     paragraph_start: int = 0
+    line_offsets: tuple[int, ...] = ()
+
+    def match_location(self, start: int, end: int) -> str:
+        if not self.line_offsets:
+            return self.location
+        first = self.paragraph_start + bisect_right(self.line_offsets, start) - 1
+        last = self.paragraph_start + bisect_right(self.line_offsets, end - 1) - 1
+        return f"L{first}" if first == last else f"L{first}-L{last}"
 
 
 @dataclass(frozen=True)
@@ -355,6 +363,17 @@ def _namespace(tag: str) -> str:
     return ""
 
 
+def _visible_children(element: ET.Element):
+    for child in element:
+        if child.tag == "{http://schemas.openxmlformats.org/markup-compatibility/2006}AlternateContent":
+            choice = child.find("{*}Choice")
+            branch = choice if choice is not None else child.find("{*}Fallback")
+            if branch is not None:
+                yield from _visible_children(branch)
+        else:
+            yield child
+
+
 class _DocxReader:
     """Collect the visible body in document order for one WordprocessingML namespace."""
 
@@ -368,7 +387,7 @@ class _DocxReader:
         return f"{{{self.ns}}}{name}"
 
     def _child(self, element: ET.Element, name: str) -> ET.Element | None:
-        for child in element:
+        for child in _visible_children(element):
             if _local_name(child.tag) == name and _namespace(child.tag) == self.ns:
                 return child
         return None
@@ -377,7 +396,7 @@ class _DocxReader:
         """Collect child elements by name, looking through content controls and tags."""
 
         found: list[ET.Element] = []
-        for child in container:
+        for child in _visible_children(container):
             if _namespace(child.tag) != self.ns:
                 continue
             local = _local_name(child.tag)
@@ -402,14 +421,14 @@ class _DocxReader:
 
     def _inline_text(self, element: ET.Element) -> str:
         parts: list[str] = []
-        for child in element:
+        for child in _visible_children(element):
             local = _local_name(child.tag)
             if local in {"del", "moveFrom", "delText"}:
                 continue
             if local == "r":
                 if self._hidden_run(child):
                     continue
-                for node in child:
+                for node in _visible_children(child):
                     node_local = _local_name(node.tag)
                     if node_local == "t" and node.text:
                         parts.append(node.text)
@@ -426,17 +445,12 @@ class _DocxReader:
         return "".join(parts)
 
     def _text_boxes(self, element: ET.Element):
-        for child in element:
+        for child in _visible_children(element):
             tag = _local_name(child.tag)
             if tag in {"del", "moveFrom"} or (tag == "r" and self._hidden_run(child)):
                 continue
             if child.tag == self._tag("txbxContent"):
                 yield child
-            elif tag == "AlternateContent":
-                choice = child.find("{*}Choice")
-                branch = choice if choice is not None else child.find("{*}Fallback")
-                if branch is not None:
-                    yield from self._text_boxes(branch)
             else:
                 yield from self._text_boxes(child)
 
@@ -498,7 +512,7 @@ class _DocxReader:
 
     def _cell_parts(self, container: ET.Element) -> list[tuple[str, bool]]:
         parts = []
-        for child in container:
+        for child in _visible_children(container):
             local = _local_name(child.tag)
             if local == "p":
                 text = self._flatten(self._inline_text(child))
@@ -559,7 +573,7 @@ class _DocxReader:
             )
 
     def walk(self, container: ET.Element) -> None:
-        for child in container:
+        for child in _visible_children(container):
             local = _local_name(child.tag)
             if local == "p":
                 self.add_paragraph(child)
@@ -621,12 +635,17 @@ def _overlaps(span: tuple[int, int], existing: list[tuple[int, int]]) -> bool:
     return any(not (span[1] <= start or span[0] >= end) for start, end in existing)
 
 
-def _metaphor_snippets(text: str) -> list[str]:
-    snippets: list[str] = []
+def _hit_excerpt(text: str, match: re.Match[str]) -> str:
+    tail = re.split(r"[。！？\n]", text[match.end():match.end() + 55], maxsplit=1)[0]
+    return f"{match.group()} ({_clip(match.group() + tail, 55)})"
+
+
+def _metaphor_snippets(text: str) -> list[tuple[str, tuple[int, int]]]:
+    snippets: list[tuple[str, tuple[int, int]]] = []
     matched_spans: list[tuple[int, int]] = []
     for match in EXPLICIT_METAPHOR_RE.finditer(text):
         matched_spans.append(match.span())
-        snippets.append(f"{match.group(0)} ({_clip(text, 55)})")
+        snippets.append((_hit_excerpt(text, match), match.span()))
 
     for match in SEDIMENT_RE.finditer(text):
         if _overlaps(match.span(), matched_spans):
@@ -634,7 +653,7 @@ def _metaphor_snippets(text: str) -> list[str]:
         window = text[max(0, match.start() - 6) : match.end() + 6]
         if SEDIMENT_CONTEXT_RE.search(window):
             continue
-        snippets.append(f"沉淀 ({_clip(window, 30)})")
+        snippets.append((f"沉淀 ({_clip(window, 30)})", match.span()))
 
     for match in BARE_BASE_RE.finditer(text):
         if _overlaps(match.span(), matched_spans):
@@ -642,7 +661,7 @@ def _metaphor_snippets(text: str) -> list[str]:
         window = text[max(0, match.start() - 8) : match.end() + 4]
         if "\n" in window or MECHANICAL_BASE_CONTEXT_RE.search(window):
             continue
-        snippets.append(f"底座 ({_clip(window, 30)})")
+        snippets.append((f"底座 ({_clip(window, 30)})", match.span()))
 
     return snippets
 
@@ -672,8 +691,8 @@ def _covers_rating(entries: list[LegendEntry], value: str) -> bool:
     return len(meanings) == 1
 
 
-def _evidence_snippets(text: str, entries: list[LegendEntry]) -> list[str]:
-    snippets: list[str] = []
+def _evidence_snippets(text: str, entries: list[LegendEntry]) -> list[tuple[str, tuple[int, int]]]:
+    snippets: list[tuple[str, tuple[int, int]]] = []
     for match in EVIDENCE_RATING_RE.finditer(text):
         token = match.group(0)
         if EVIDENCE_DIRECTION_RE.search(token):
@@ -682,11 +701,11 @@ def _evidence_snippets(text: str, entries: list[LegendEntry]) -> list[str]:
         if _covers_rating(entries, rating):
             continue
         if entries:
-            snippets.append(f"方向不明取证评级: {token}（图例未覆盖该值，向委托人核对）")
+            snippets.append((f"方向不明取证评级: {token}（图例未覆盖该值，向委托人核对）", match.span()))
             continue
-        snippets.append(
-            f"方向不明取证评级: {token}（写清是难度高=较难还是易得性高=较易；无图例时向委托人核对）"
-        )
+        snippets.append((
+            f"方向不明取证评级: {token}（写清是难度高=较难还是易得性高=较易；无图例时向委托人核对）", match.span()
+        ))
     return snippets
 
 
@@ -710,16 +729,16 @@ def _syntax_snippets(text: str) -> list[str]:
 
 def _category_hits(
     text: str, entries: list[LegendEntry]
-) -> list[tuple[str, str]]:
-    hits: list[tuple[str, str]] = []
-    for snippet in _metaphor_snippets(text):
-        hits.append(("伪专业隐喻", snippet))
+) -> list[tuple[str, str, tuple[int, int]]]:
+    hits: list[tuple[str, str, tuple[int, int]]] = []
+    for snippet, span in _metaphor_snippets(text):
+        hits.append(("伪专业隐喻", snippet, span))
     for match in TRANSLATIONESE_RE.finditer(text):
-        hits.append(("英文直译腔", f"{match.group(0)} ({_clip(text, 55)})"))
+        hits.append(("英文直译腔", _hit_excerpt(text, match), match.span()))
     for match in BUREAUCRATIC_BLOAT_RE.finditer(text):
-        hits.append(("空泛管理堆砌", f"{match.group(0)} ({_clip(text, 55)})"))
-    for snippet in _evidence_snippets(text, entries):
-        hits.append(("表头或格内压缩失义", snippet))
+        hits.append(("空泛管理堆砌", _hit_excerpt(text, match), match.span()))
+    for snippet, span in _evidence_snippets(text, entries):
+        hits.append(("表头或格内压缩失义", snippet, span))
     return hits
 
 
@@ -756,32 +775,6 @@ def _soft_join(parts: list[str]) -> tuple[str, list[int]]:
         chunks.append(text)
         position += len(text)
     return "".join(chunks), offsets
-
-
-def _paragraph_inline_code(parts: list[Segment]) -> list[tuple[str, list[str]]]:
-    """Mask inline code over a whole paragraph so a wrapped span stays one span."""
-
-    texts = [part.text for part in parts]
-    joined, offsets = _soft_join(texts)
-    masked, literals = _split_inline_code_spans(joined)
-    result: list[tuple[str, list[str]]] = [
-        (masked[offset : offset + len(text)], []) for offset, text in zip(offsets, texts)
-    ]
-    for position, value in literals:
-        # A wrapped literal belongs to the line where the span opens.
-        owner = bisect_right(offsets, position) - 1
-        result[owner][1].append(value)
-    return result
-
-
-def _paragraph_masks(segments: list[Segment]) -> list[tuple[str, list[str]]]:
-    masks = []
-    for start, group in groupby(segments, key=lambda seg: seg.paragraph_start):
-        if start:
-            masks.extend(_paragraph_inline_code(list(group)))
-        else:
-            masks.extend(_split_inline_code(seg.text) for seg in group)
-    return masks
 
 
 def _protection_reason(seg: Segment) -> str:
@@ -858,21 +851,21 @@ def _scan_segment(
     column: int = 0,
     findings: list[Finding],
     disclose,
-    inline: tuple[str, list[str]] | None = None,
 ) -> None:
     suffix = f"（第{column}列）" if column else ""
-    masked, literals = inline if inline is not None else _split_inline_code(seg.text)
-    for category, snippet in _category_hits(masked, entries):
+    masked, literals = _split_inline_code_spans(seg.text)
+    for category, snippet, span in _category_hits(masked, entries):
+        location = seg.match_location(*span)
         if editable:
             findings.append(
-                Finding(category, seg.location, f"{snippet}{suffix}", role, CATEGORY_ACTIONS[category])
+                Finding(category, location, f"{snippet}{suffix}", role, CATEGORY_ACTIONS[category])
             )
         else:
-            disclose(seg.location, f"{snippet}{suffix}", role)
+            disclose(location, f"{snippet}{suffix}", role)
 
-    for literal in literals:
-        for category, snippet in _category_hits(literal, entries):
-            disclose(seg.location, f"{snippet}{suffix}", "原字段值（行内代码）")
+    for position, literal in literals:
+        for category, snippet, _ in _category_hits(literal, entries):
+            disclose(seg.match_location(position, position + 1), f"{snippet}{suffix}", "原字段值（行内代码）")
 
 
 def _location_key(location: str):
@@ -890,8 +883,8 @@ def _paragraph_units(segments: list[Segment]) -> list[Segment]:
         if len(parts) == 1:
             units.extend(parts)
             continue
-        text, _ = _soft_join([part.text for part in parts])
-        units.append(replace(parts[0], text=text, location=f"L{start}-{parts[-1].location}"))
+        text, offsets = _soft_join([part.text for part in parts])
+        units.append(replace(parts[0], text=text, line_offsets=tuple(offsets), location=f"L{start}-{parts[-1].location}"))
     return units
 
 
@@ -980,7 +973,7 @@ def analyze_file(path: Path) -> FileReport:
 
     protected = _protected_columns(segments)
     table_legends = _table_legends(segments)
-    masks = _paragraph_masks(segments)
+    paragraphs = _paragraph_units(segments)
     prose_entries: list[LegendEntry] = []
     previous_table = ""
     table_headers: dict[str, dict[int, str]] = defaultdict(dict)
@@ -992,7 +985,7 @@ def analyze_file(path: Path) -> FileReport:
                 prior = table_headers[seg.table].get(index, "")
                 table_headers[seg.table][index] = f"{prior} {cell.strip()}".strip()
 
-    for seg_index, seg in enumerate(segments):
+    for seg in paragraphs:
         if seg.kind in {"table_header", "table_row"}:
             blocked = protected.get(seg.table, set())
             if previous_table and previous_table != seg.table:
@@ -1088,7 +1081,7 @@ def analyze_file(path: Path) -> FileReport:
         if seg.kind == "heading" or re.match(r"^表(?:[A-Z0-9一二三四五六七八九十]+)(?:[ \u3000]|$)", seg.text):
             prose_entries = []
         if seg.editable:
-            clean = masks[seg_index][0]
+            clean, _ = _split_inline_code(seg.text)
             definitions = [LegendEntry(m[1], m[2], _legend_metric(clean))
                            for m in LEGEND_INLINE_RE.finditer(clean)]
             if definitions:
@@ -1101,10 +1094,8 @@ def analyze_file(path: Path) -> FileReport:
             entries=prose_entries,
             findings=findings,
             disclose=disclose,
-            inline=masks[seg_index],
         )
 
-    paragraphs = _paragraph_units(segments)
     for seg in paragraphs:
         if seg.kind == "prose" and seg.editable:
             clean, _ = _split_inline_code(seg.text)
@@ -1115,8 +1106,8 @@ def analyze_file(path: Path) -> FileReport:
 
     total_cjk = len(CJK_RE.findall("\n".join(seg.text for seg in segments)))
     body_text = "\n".join(
-        masks[index][0]
-        for index, seg in enumerate(segments)
+        _split_inline_code(seg.text)[0]
+        for seg in paragraphs
         if seg.kind in {"prose", "heading"} and seg.editable
     )
     body_cjk = len(CJK_RE.findall(body_text))
